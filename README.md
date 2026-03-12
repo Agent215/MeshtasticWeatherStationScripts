@@ -12,6 +12,24 @@ The implemented code today focuses on the Raspberry Pi Pico W in the garden:
 
 The broader system described in the documentation extends that path to a home Meshtastic node, a Raspberry Pi gateway, local SQLite storage, and AWS delivery.
 
+## Table of Contents
+
+- [System Overview](#system-overview)
+- [Repository Contents](#repository-contents)
+- [Implemented Script Behavior](#implemented-script-behavior)
+  - [`main.py`](#mainpy)
+  - [`mock_tempest_sender.py`](#mock_tempest_senderpy)
+- [Hardware and Interface Notes](#hardware-and-interface-notes)
+- [Setup](#setup)
+  - [Pico W bridge](#pico-w-bridge)
+  - [Mock testing](#mock-testing)
+- [Documentation Summary](#documentation-summary)
+  - [Overall system design](#overall-system-design)
+  - [Planned home gateway](#planned-home-gateway)
+- [Current Project Status](#current-project-status)
+- [Notes](#notes)
+- [License](#license)
+
 ## System Overview
 
 Planned message flow:
@@ -94,10 +112,31 @@ Based on the code and design docs, the important garden-side assumptions are:
 
 - The Tempest hub and Pico W must be on the same local Wi-Fi network
 - Tempest data is consumed from local UDP broadcast on port `50222`
-- Pico W UART is configured for:
+- Pico W UART uses:
   - `GP0` as TX
   - `GP1` as RX
   - `115200` baud
+- Garden Meshtastic node serial settings should be:
+
+```text
+Serial enabled: ON
+Echo enabled: ON
+RX: 15
+TX: 16
+Serial baud rate: 115200
+Timeout: 0
+Serial mode: TEXTMSG
+Override console serial port: OFF
+```
+
+- Pico W to RAK4630 wiring should be:
+
+```text
+Pico GP0 (TX) -> RAK RX1
+Pico GP1 (RX) -> RAK TX1
+Pico GND      -> RAK GND
+```
+
 - UART wiring to the RAK/Meshtastic node should use 3.3 V logic and shared ground
 - Do not feed 5 V UART logic into the RAK UART pins
 
@@ -110,11 +149,28 @@ Based on the code and design docs, the important garden-side assumptions are:
    - `WIFI_SSID`
    - `WIFI_PASSWORD`
 3. Copy `main.py` to the Pico as the boot script.
-4. Wire the Pico to the garden RAK node:
-   - Pico `GP0` TX -> RAK RX
-   - Pico `GP1` RX -> RAK TX
-   - GND -> GND
-5. Power the Pico and confirm it joins Wi-Fi and starts listening on UDP port `50222`.
+4. Configure the garden Meshtastic node serial settings:
+
+```text
+Serial enabled: ON
+Echo enabled: ON
+RX: 15
+TX: 16
+Serial baud rate: 115200
+Timeout: 0
+Serial mode: TEXTMSG
+Override console serial port: OFF
+```
+
+5. Wire the Pico to the RAK4630:
+
+```text
+Pico GP0 (TX) -> RAK RX1
+Pico GP1 (RX) -> RAK TX1
+Pico GND      -> RAK GND
+```
+
+6. Power the Pico and confirm it joins Wi-Fi and starts listening on UDP port `50222`.
 
 ### Mock testing
 
