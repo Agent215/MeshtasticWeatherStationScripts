@@ -1,231 +1,135 @@
-# Weather Station Scripts
+# Tempest UDP -> Meshtastic UART Bridge (Pico W)
 
-This repository contains the garden-side bridge code for a self-hosted weather station and the current design documents for the full end-to-end system.
+Resilience-focused MicroPython bridge for Raspberry Pi Pico W:
 
-The implemented code today focuses on the Raspberry Pi Pico W in the garden:
+- listens for WeatherFlow Tempest UDP broadcast packets on port `50222`
+- validates/parses `obs_st` packets
+- emits compact newline-delimited JSON over UART to a Meshtastic-connected device
+- survives malformed data, Wi-Fi outages, transient UART failures, and subsystem exceptions
 
-- Listen for local WeatherFlow Tempest UDP broadcasts on the garden LAN
-- Extract the key `obs_st` weather fields
-- Validate and compact the payload
-- Forward the result over UART to a Meshtastic/RAK node
-- Emit periodic heartbeat/status messages
+## Code structure
 
-The broader system described in the documentation extends that path to a home Meshtastic node, a Raspberry Pi gateway, local SQLite storage, and AWS delivery.
+- `main.py`: thin hardware boot entrypoint for Pico W.
+- `weather_bridge/core.py`: pure parsing/validation/payload formatting logic.
+- `weather_bridge/retry.py`: simple bounded exponential backoff policy.
+- `weather_bridge/state_machine.py`: explicit runtime states.
+- `weather_bridge/diagnostics.py`: structured counters and event log snapshots.
+- `weather_bridge/adapters.py`: hardware adapters (Wi-Fi, UDP, UART, clock) + abstractions.
+- `weather_bridge/runtime.py`: orchestration loop, fault containment, recovery behavior, fault injection hooks.
 
-## Table of Contents
+## Runtime state machine
 
-- [System Overview](#system-overview)
-- [Repository Contents](#repository-contents)
-- [Implemented Script Behavior](#implemented-script-behavior)
-  - [`main.py`](#mainpy)
-  - [`mock_tempest_sender.py`](#mock_tempest_senderpy)
-- [Hardware and Interface Notes](#hardware-and-interface-notes)
-- [Setup](#setup)
-  - [Pico W bridge](#pico-w-bridge)
-  - [Mock testing](#mock-testing)
-- [Documentation Summary](#documentation-summary)
-  - [Overall system design](#overall-system-design)
-  - [Planned home gateway](#planned-home-gateway)
-- [Current Project Status](#current-project-status)
-- [Notes](#notes)
-- [License](#license)
+States:
 
-## System Overview
+- `BOOTING`
+- `WIFI_CONNECTING`
+- `UDP_READY`
+- `RECOVERING`
+- `FATAL_RESTART_PENDING`
 
-Planned message flow:
+High-level flow:
 
-`Tempest sensor -> Tempest hub -> garden Wi-Fi LAN -> Pico W -> UART -> garden RAK node -> Meshtastic mesh -> home RAK node -> Raspberry Pi -> SQLite -> AWS`
+1. Boot and attempt Wi-Fi connect.
+2. Move to `UDP_READY` when connected.
+3. Receive UDP; parse only valid `obs_st` packets.
+4. Forward weather payloads over UART with rate-limiting and dedup.
+5. Send idle heartbeats periodically.
+6. On exception, enter `RECOVERING`, reopen UDP, and apply backoff.
+7. If failures exceed threshold, move to `FATAL_RESTART_PENDING` and reset.
 
-Current code in this repo implements the `garden Wi-Fi LAN -> Pico W -> UART` portion and includes a mock UDP sender for bench testing.
+## Fault injection hooks
 
-## Repository Contents
+`FaultInjector` in `weather_bridge/runtime.py` supports simulation of:
 
-- [`main.py`](./main.py): MicroPython application for the Raspberry Pi Pico W
-- [`mock_tempest_sender.py`](./mock_tempest_sender.py): desktop test utility that sends Tempest-style `obs_st` UDP packets
-- [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md): overall system architecture, hardware, interfaces, power, bring-up plan, and AWS overview
-- [`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md): planned Raspberry Pi home gateway design, packet handling, SQLite schema, retry behavior, and deployment notes
+- Wi-Fi loss (`force_wifi_loss`)
+- malformed UDP (`force_malformed_udp`)
+- socket exceptions (`force_socket_exception`)
+- UART write exceptions (`force_uart_exception`)
+- memory pressure (`force_memory_pressure`)
+- forced main-loop exception (`force_main_loop_exception`)
 
-## Implemented Script Behavior
+## Diagnostics counters/logging
 
-### `main.py`
+`Diagnostics.counters` includes:
 
-`main.py` is intended to run on a Raspberry Pi Pico W under MicroPython.
+- Wi-Fi connect attempts/failures
+- UDP received/malformed/socket errors
+- UART sent/errors
+- heartbeat sent
+- recoveries
+- top-level exceptions
+- memory pressure events
 
-It does the following:
+`Diagnostics.events` stores structured event records (recent tail kept in snapshot).
 
-- Connects the Pico W to the local garden Wi-Fi network
-- Binds a UDP listener on port `50222`
-- Accepts Tempest `obs_st` packets and ignores other packet types
-- Extracts these fields from the first observation record:
-  - timestamp
-  - temperature
-  - humidity
-  - pressure
-  - average wind speed
-  - wind direction
-  - rain accumulation for the interval
-- Rejects malformed or out-of-range readings
-- Suppresses duplicate or stale observations using the source timestamp
-- Limits forwarding to one weather message per 60 seconds
-- Sends compact newline-delimited JSON over UART at `115200` baud
-- Sends a heartbeat/status JSON message every 6 hours
-- Attempts Wi-Fi recovery and reboots the Pico after repeated unrecoverable failures
+## Host-side tests (desktop Python)
 
-Weather payload sent over UART:
+### Install and run
 
-```json
-{"i":17,"t":22.5,"h":52,"p":1011.4,"w":3.4,"d":230,"r":0.0}
+```bash
+python -m pip install -U pytest
+pytest -q
 ```
 
-Heartbeat payload sent over UART:
+### Coverage focus
 
-```json
-{"sys":"ok","i":18,"up":21600,"ip":"192.168.1.205"}
+- packet parsing (`tests/test_unit_logic.py`)
+- malformed packet handling (`tests/test_unit_logic.py`, `tests/test_component_runtime.py`)
+- payload construction (`tests/test_unit_logic.py`)
+- retry/backoff logic (`tests/test_unit_logic.py`)
+- state machine transitions (`tests/test_unit_logic.py`)
+- exception containment (`tests/test_component_runtime.py`)
+- component behavior with fake adapters (`tests/test_component_runtime.py`, `tests/fakes.py`)
+
+## Device-side test scripts (mpremote)
+
+Scripts in `device_tests/`:
+
+- `test_wifi_reconnect.py`
+- `test_udp_receive.py`
+- `test_malformed_tolerance.py`
+- `test_uart_send.py`
+- `test_idle_heartbeat.py`
+- `test_top_level_recovery.py`
+
+### Copy and run on Pico
+
+```bash
+mpremote fs cp -r weather_bridge :weather_bridge
+mpremote fs cp -r device_tests :device_tests
+mpremote run device_tests/test_wifi_reconnect.py
+mpremote run device_tests/test_udp_receive.py
+mpremote run device_tests/test_malformed_tolerance.py
+mpremote run device_tests/test_uart_send.py
+mpremote run device_tests/test_idle_heartbeat.py
+mpremote run device_tests/test_top_level_recovery.py
 ```
 
-### `mock_tempest_sender.py`
+Each script prints `PASS <name>` or `FAIL <name> <error>`.
 
-This script is a host-side test tool for bench work and LAN validation.
+## Test matrix and pass/fail criteria
 
-It does the following:
+| Area | Host unit | Host component | Device script | Pass criteria |
+|---|---|---|---|---|
+| Packet parsing | ✅ | ✅ | `test_udp_receive.py` | valid `obs_st` produces compact weather payload |
+| Malformed handling | ✅ | ✅ | `test_malformed_tolerance.py` | malformed packet increments malformed counter, loop keeps running |
+| Payload construction | ✅ | ✅ | `test_uart_send.py` | newline-delimited compact JSON over UART |
+| Retry/backoff | ✅ | ✅ | `test_wifi_reconnect.py` | reconnect retries, backoff/recovery state entered |
+| State machine | ✅ | ✅ | `test_top_level_recovery.py` | transitions among BOOTING/WIFI_CONNECTING/UDP_READY/RECOVERING/FATAL |
+| Exception containment | ✅ | ✅ | `test_top_level_recovery.py` | exceptions do not hang process; recovery/fatal path taken |
+| Idle heartbeat | (via component) | ✅ | `test_idle_heartbeat.py` | heartbeat emitted when no UDP traffic |
 
-- Generates realistic-looking Tempest `obs_st` UDP payloads
-- Sends them to a target IP and port at a configurable interval
-- Defaults to UDP broadcast on `255.255.255.255:50222`
-- Can also send directly to the Pico W IP for unicast testing
+## Recovery behavior by fault class
 
-Example:
+- **Power failure / abrupt reboot**: startup is stateless and idempotent; runtime re-enters Wi-Fi connect and UDP ready flow automatically.
+- **Malformed packets**: parser returns `None`; packet is counted as malformed and ignored.
+- **No UDP traffic**: socket timeout is treated as normal; loop continues and heartbeat still emits.
+- **Wi-Fi outage**: transitions to `WIFI_CONNECTING`/`RECOVERING`; retries with bounded exponential backoff.
+- **Repeated UART errors**: enters recovery path, increments counters, retries loop; escalates to fatal reset threshold.
+- **Unexpected subsystem exceptions**: caught at top-level tick, logged as structured recovery events; UDP reopened and backoff applied.
 
-```powershell
-python mock_tempest_sender.py --target 192.168.1.205 --interval 10
-```
+## Hardware notes
 
-Or broadcast on the local LAN:
-
-```powershell
-python mock_tempest_sender.py
-```
-
-## Hardware and Interface Notes
-
-Based on the code and design docs, the important garden-side assumptions are:
-
-- The Tempest hub and Pico W must be on the same local Wi-Fi network
-- Tempest data is consumed from local UDP broadcast on port `50222`
-- Pico W UART uses:
-  - `GP0` as TX
-  - `GP1` as RX
-  - `115200` baud
-- Garden Meshtastic node serial settings should be:
-
-```text
-Serial enabled: ON
-Echo enabled: ON
-RX: 15
-TX: 16
-Serial baud rate: 115200
-Timeout: 0
-Serial mode: TEXTMSG
-Override console serial port: OFF
-```
-
-- Pico W to RAK4630 wiring should be:
-
-```text
-Pico GP0 (TX) -> RAK RX1
-Pico GP1 (RX) -> RAK TX1
-Pico GND      -> RAK GND
-```
-
-- UART wiring to the RAK/Meshtastic node should use 3.3 V logic and shared ground
-- Do not feed 5 V UART logic into the RAK UART pins
-
-## Setup
-
-### Pico W bridge
-
-1. Install MicroPython on the Raspberry Pi Pico W.
-2. Edit [`main.py`](./main.py) and set:
-   - `WIFI_SSID`
-   - `WIFI_PASSWORD`
-3. Copy `main.py` to the Pico as the boot script.
-4. Configure the garden Meshtastic node serial settings:
-
-```text
-Serial enabled: ON
-Echo enabled: ON
-RX: 15
-TX: 16
-Serial baud rate: 115200
-Timeout: 0
-Serial mode: TEXTMSG
-Override console serial port: OFF
-```
-
-5. Wire the Pico to the RAK4630:
-
-```text
-Pico GP0 (TX) -> RAK RX1
-Pico GP1 (RX) -> RAK TX1
-Pico GND      -> RAK GND
-```
-
-6. Power the Pico and confirm it joins Wi-Fi and starts listening on UDP port `50222`.
-
-### Mock testing
-
-1. Put the Pico W on the same LAN as the machine running the mock sender.
-2. Start the Pico bridge.
-3. Run [`mock_tempest_sender.py`](./mock_tempest_sender.py) from a desktop Python environment.
-4. Confirm the Pico logs parsed `obs_st` packets and forwards compact JSON over UART.
-
-## Documentation Summary
-
-### Overall system design
-
-[`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md) defines the recommended full architecture:
-
-- Tempest sensor and hub in the garden
-- Private garden Wi-Fi LAN
-- Pico W as the local UDP-to-UART bridge
-- Garden and home Meshtastic nodes using US915 LoRa
-- Raspberry Pi home gateway over USB
-- AWS backend using API Gateway, Lambda, and DynamoDB
-- 12 V solar/battery power with a regulated 5 V rail for garden electronics
-
-### Planned home gateway
-
-[`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md) describes the not-yet-implemented home-side service:
-
-- USB serial ingest from the home Meshtastic node
-- Packet classification into weather vs. health/status
-- SQLite as the local system of record
-- Durable AWS retry queue
-- Derived node state such as `healthy`, `degraded`, `offline`, and `bad_health`
-- `systemd` deployment on a Raspberry Pi 5
-
-## Current Project Status
-
-Implemented in this repo:
-
-- Pico W UDP listener and UART bridge
-- Compact outbound weather payload format
-- Heartbeat/status payloads from the Pico
-- Mock Tempest UDP sender for testing
-
-Specified in docs but not implemented here yet:
-
-- Raspberry Pi home gateway service
-- SQLite storage and deduplication layer
-- AWS delivery worker and retry queue
-- Website or dashboard
-
-## Notes
-
-- `main.py` is MicroPython code for the Pico W, not standard desktop Python.
-- `mock_tempest_sender.py` is standard Python intended to run on a laptop or desktop during testing.
-- There are currently no automated tests in this repository.
-
-## License
-
-This project is licensed under the terms in [`LICENSE`](./LICENSE).
+- Tempest hub and Pico W must share the same LAN.
+- UART uses 3.3V logic and shared ground.
+- Default UART pins in `main.py`: `GP0` TX, `GP1` RX.
