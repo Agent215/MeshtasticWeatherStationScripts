@@ -3,7 +3,7 @@ import socket
 import time
 import json
 import machine
-from machine import Pin, UART
+from machine import Pin, UART, WDT
 
 # ----------------------------
 # User settings
@@ -30,27 +30,91 @@ MAX_CONSECUTIVE_MAIN_LOOP_FAILURES = 10
 STARTUP_DELAY_SEC = 3
 HEARTBEAT_INTERVAL_SEC = 6 * 60 * 60   # every 6 hours
 
+# Optional small pause after socket recreation / reconnect
+POST_RECOVERY_DELAY_MS = 250
+
+# Watchdog
+ENABLE_WATCHDOG = True
+WATCHDOG_TIMEOUT_MS = 8000  # RP2040 practical max is ~8388 ms
+
+# No-weather staged recovery thresholds
+NO_WEATHER_SOCKET_RECOVERY_THRESHOLD = 60
+NO_WEATHER_WIFI_RECOVERY_THRESHOLD = 120
+NO_WEATHER_REBOOT_THRESHOLD = 180
+
 # ----------------------------
 # Hardware init
 # ----------------------------
 led = Pin("LED", Pin.OUT)
 uart = UART(0, baudrate=UART_BAUD, tx=Pin(UART_TX_PIN), rx=Pin(UART_RX_PIN))
 
+# IMPORTANT:
+# Create watchdog only after Wi-Fi + socket setup succeeds.
+wdt = None
+
+# ----------------------------
+# Global runtime state
+# ----------------------------
 msg_id = 1
-last_obs_ts = None
-last_forward_monotonic = 0
-last_heartbeat_monotonic = 0
-boot_monotonic = time.time()
+
+last_forward_tick_ms = None
+last_heartbeat_tick_ms = None
+boot_tick_ms = time.ticks_ms()
+
 consecutive_wifi_failures = 0
 consecutive_main_loop_failures = 0
+consecutive_no_weather_feeds = 0
+
+# staged recovery guards so we don't repeat the same action every loop
+socket_recovery_triggered = False
+wifi_recovery_triggered = False
 
 
+# ----------------------------
+# Utility helpers
+# ----------------------------
 def blink(times=1, on_time=0.12, off_time=0.12):
     for _ in range(times):
         led.on()
         time.sleep(on_time)
         led.off()
         time.sleep(off_time)
+
+
+def ticks_since_ms(start_tick):
+    return time.ticks_diff(time.ticks_ms(), start_tick)
+
+
+def seconds_to_ms(seconds):
+    return int(seconds * 1000)
+
+
+def feed_watchdog():
+    if wdt is not None:
+        wdt.feed()
+
+
+def register_healthy_no_weather_progress():
+    """
+    Feed watchdog for a healthy loop cycle that did NOT send weather,
+    and increment the no-weather counter.
+    Heartbeat does not reset this counter.
+    """
+    global consecutive_no_weather_feeds
+    feed_watchdog()
+    consecutive_no_weather_feeds += 1
+
+
+def reset_no_weather_counter():
+    """
+    Reset only on successful weather send.
+    """
+    global consecutive_no_weather_feeds
+    global socket_recovery_triggered, wifi_recovery_triggered
+
+    consecutive_no_weather_feeds = 0
+    socket_recovery_triggered = False
+    wifi_recovery_triggered = False
 
 
 def wifi_is_connected(wlan):
@@ -62,16 +126,24 @@ def wifi_is_connected(wlan):
 
 def reset_wlan():
     wlan = network.WLAN(network.STA_IF)
+
     try:
         wlan.disconnect()
     except Exception:
         pass
+
     try:
         wlan.active(False)
     except Exception:
         pass
+
     time.sleep(1)
-    wlan.active(True)
+
+    try:
+        wlan.active(True)
+    except Exception:
+        pass
+
     time.sleep(1)
     return wlan
 
@@ -82,25 +154,34 @@ def connect_wifi(ssid, password, timeout_sec=WIFI_CONNECT_TIMEOUT_SEC):
     print("Connecting to Wi-Fi:", ssid)
     wlan.connect(ssid, password)
 
-    start = time.time()
+    start_tick = time.ticks_ms()
+    timeout_ms = seconds_to_ms(timeout_sec)
+
     while not wlan.isconnected():
-        if time.time() - start > timeout_sec:
+        if ticks_since_ms(start_tick) > timeout_ms:
             raise RuntimeError("Wi-Fi connection timeout")
+
         blink(1, 0.05, 0.20)
+        feed_watchdog()
         time.sleep(1)
 
     print("Wi-Fi connected")
     print("IP config:", wlan.ifconfig())
     blink(3, 0.08, 0.08)
+    feed_watchdog()
     return wlan
 
 
 def ensure_wifi_connected(wlan, ssid, password):
+    """
+    Returns (wlan, reconnected)
+    reconnected=True means caller should recreate UDP socket.
+    """
     global consecutive_wifi_failures
 
     if wifi_is_connected(wlan):
         consecutive_wifi_failures = 0
-        return wlan
+        return wlan, False
 
     print("Wi-Fi disconnected. Reconnecting...")
 
@@ -109,7 +190,8 @@ def ensure_wifi_connected(wlan, ssid, password):
             wlan = connect_wifi(ssid, password)
             print("Wi-Fi reconnected. IP:", wlan.ifconfig()[0])
             consecutive_wifi_failures = 0
-            return wlan
+            return wlan, True
+
         except Exception as e:
             consecutive_wifi_failures += 1
             print("Wi-Fi reconnect failed:", e)
@@ -120,6 +202,7 @@ def ensure_wifi_connected(wlan, ssid, password):
                 time.sleep(2)
                 machine.reset()
 
+            feed_watchdog()
             time.sleep(WIFI_RETRY_DELAY_SEC)
 
 
@@ -138,12 +221,93 @@ def recreate_udp_listener(old_sock, port):
             old_sock.close()
     except Exception:
         pass
-    return make_udp_listener(port)
+
+    sock = make_udp_listener(port)
+    time.sleep_ms(POST_RECOVERY_DELAY_MS)
+    feed_watchdog()
+    return sock
 
 
+def is_socket_timeout_error(exc):
+    try:
+        args = getattr(exc, "args", ())
+        if args:
+            first = args[0]
+
+            if isinstance(first, int):
+                if first in (110,):
+                    return True
+
+            if isinstance(first, str):
+                s = first.lower()
+                if "timed out" in s or "timeout" in s:
+                    return True
+
+        s = str(exc).lower()
+        if "timed out" in s or "timeout" in s:
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def maybe_trigger_no_weather_recovery(wlan, sock):
+    """
+    Staged recovery based on consecutive healthy watchdog feeds without a weather send.
+
+    >= 60  -> recreate UDP socket
+    >= 120 -> reconnect Wi-Fi
+    >= 180 -> reboot Pico
+
+    Returns (wlan, sock)
+    """
+    global socket_recovery_triggered, wifi_recovery_triggered, consecutive_no_weather_feeds
+
+    if consecutive_no_weather_feeds >= NO_WEATHER_REBOOT_THRESHOLD:
+        print("No weather sends for", consecutive_no_weather_feeds, "healthy feeds. Rebooting Pico...")
+        time.sleep(2)
+        machine.reset()
+
+    if (consecutive_no_weather_feeds >= NO_WEATHER_WIFI_RECOVERY_THRESHOLD
+            and not wifi_recovery_triggered):
+        print("No weather sends for", consecutive_no_weather_feeds,
+              "healthy feeds. Forcing Wi-Fi reconnect...")
+        wifi_recovery_triggered = True
+
+        try:
+            wlan = reset_wlan()
+            wlan, reconnected = ensure_wifi_connected(wlan, WIFI_SSID, WIFI_PASSWORD)
+            if reconnected:
+                sock = recreate_udp_listener(sock, UDP_PORT)
+        except Exception as e:
+            print("Wi-Fi staged recovery failed:", e)
+
+        return wlan, sock
+
+    if (consecutive_no_weather_feeds >= NO_WEATHER_SOCKET_RECOVERY_THRESHOLD
+            and not socket_recovery_triggered):
+        print("No weather sends for", consecutive_no_weather_feeds,
+              "healthy feeds. Recreating UDP socket...")
+        socket_recovery_triggered = True
+
+        try:
+            sock = recreate_udp_listener(sock, UDP_PORT)
+        except Exception as e:
+            print("Socket staged recovery failed:", e)
+
+        return wlan, sock
+
+    return wlan, sock
+
+
+# ----------------------------
+# Weather parsing / validation
+# ----------------------------
 def round_weather_fields(obs):
     return {
-        "ts": int(obs[0]),
+        "ts": int(obs[0]),                  # Tempest observation timestamp
         "t": round(float(obs[7]), 1),
         "h": int(round(float(obs[8]))),
         "p": round(float(obs[6]), 1),
@@ -192,31 +356,43 @@ def parse_obs_st(packet_obj):
         return None
 
 
-def is_fresh_observation(compact_weather):
-    global last_obs_ts
-
-    obs_ts = compact_weather["ts"]
-    if last_obs_ts is not None and obs_ts <= last_obs_ts:
-        return False
-
-    last_obs_ts = obs_ts
-    return True
-
-
 def may_forward_now():
-    global last_forward_monotonic
-    now = time.time()
+    """
+    Check only. Do not commit state here.
+    """
+    global last_forward_tick_ms
 
-    if last_forward_monotonic != 0 and (now - last_forward_monotonic) < MIN_FORWARD_INTERVAL_SEC:
+    if last_forward_tick_ms is None:
+        return True
+
+    min_interval_ms = seconds_to_ms(MIN_FORWARD_INTERVAL_SEC)
+    if time.ticks_diff(time.ticks_ms(), last_forward_tick_ms) < min_interval_ms:
         return False
 
-    last_forward_monotonic = now
     return True
 
 
+def commit_forward_success():
+    """
+    Commit delivery-related state only after successful UART send.
+    """
+    global last_forward_tick_ms
+    last_forward_tick_ms = time.ticks_ms()
+
+
+# ----------------------------
+# UART send helpers
+# ----------------------------
 def uart_send_json(payload):
     msg = json.dumps(payload, separators=(",", ":")) + "\n"
-    uart.write(msg)
+
+    written = uart.write(msg)
+    if written is None:
+        written = len(msg)
+
+    if written != len(msg):
+        raise RuntimeError("Partial UART write: wrote {} of {} bytes".format(written, len(msg)))
+
     print("UART sent:", msg.strip())
     blink(1, 0.15, 0.05)
 
@@ -226,6 +402,7 @@ def send_weather_to_rak(compact_weather):
 
     payload = {
         "i": msg_id,
+        "ts": compact_weather["ts"],
         "t": compact_weather["t"],
         "h": compact_weather["h"],
         "p": compact_weather["p"],
@@ -239,79 +416,135 @@ def send_weather_to_rak(compact_weather):
 
 
 def maybe_send_heartbeat(wlan):
-    global last_heartbeat_monotonic, msg_id
+    global last_heartbeat_tick_ms, msg_id
 
-    now = time.time()
-    if last_heartbeat_monotonic != 0 and (now - last_heartbeat_monotonic) < HEARTBEAT_INTERVAL_SEC:
-        return
+    now_tick = time.ticks_ms()
+    interval_ms = seconds_to_ms(HEARTBEAT_INTERVAL_SEC)
+
+    if last_heartbeat_tick_ms is not None:
+        if time.ticks_diff(now_tick, last_heartbeat_tick_ms) < interval_ms:
+            return False
 
     try:
         ip = wlan.ifconfig()[0] if wifi_is_connected(wlan) else "0.0.0.0"
     except Exception:
         ip = "0.0.0.0"
 
-    uptime = int(now - boot_monotonic)
+    uptime = ticks_since_ms(boot_tick_ms) // 1000
 
     payload = {
         "sys": "ok",
         "i": msg_id,
         "up": uptime,
-        "ip": ip
+        "ip": ip,
+        "nw": consecutive_no_weather_feeds
     }
 
     uart_send_json(payload)
     msg_id += 1
-    last_heartbeat_monotonic = now
+    last_heartbeat_tick_ms = now_tick
+    return True
 
 
+# ----------------------------
+# Main
+# ----------------------------
 def main():
-    global consecutive_main_loop_failures
+    global consecutive_main_loop_failures, wdt
 
     print("Startup delay:", STARTUP_DELAY_SEC, "seconds")
     time.sleep(STARTUP_DELAY_SEC)
 
-    wlan = ensure_wifi_connected(None, WIFI_SSID, WIFI_PASSWORD)
+    wlan, _ = ensure_wifi_connected(None, WIFI_SSID, WIFI_PASSWORD)
     print("Pico IP address:", wlan.ifconfig()[0])
 
     sock = make_udp_listener(UDP_PORT)
 
+    # Enable watchdog only after successful startup.
+    if ENABLE_WATCHDOG:
+        wdt = WDT(timeout=WATCHDOG_TIMEOUT_MS)
+        feed_watchdog()
+        print("Watchdog enabled")
+
     print("Ready. Waiting for Tempest-style UDP packets...")
+
     while True:
+        sent_weather_this_cycle = False
+
         try:
-            wlan = ensure_wifi_connected(wlan, WIFI_SSID, WIFI_PASSWORD)
-            maybe_send_heartbeat(wlan)
+            wlan, reconnected = ensure_wifi_connected(wlan, WIFI_SSID, WIFI_PASSWORD)
+            feed_watchdog()
+
+            if reconnected:
+                print("Recreating UDP listener after Wi-Fi reconnect...")
+                sock = recreate_udp_listener(sock, UDP_PORT)
+                feed_watchdog()
+
+            heartbeat_sent = maybe_send_heartbeat(wlan)
+            if heartbeat_sent:
+                # Feed watchdog, but do NOT reset no-weather counter.
+                feed_watchdog()
 
             data, addr = sock.recvfrom(2048)
 
             try:
                 text = data.decode("utf-8")
             except Exception as e:
-                print("Decode error:", e)
+                print("Decode error from", addr, ":", e)
+                register_healthy_no_weather_progress()
+                wlan, sock = maybe_trigger_no_weather_recovery(wlan, sock)
                 continue
 
             try:
                 packet_obj = json.loads(text)
             except Exception as e:
-                print("JSON parse error:", e)
+                print("JSON parse error from", addr, ":", e)
+                register_healthy_no_weather_progress()
+                wlan, sock = maybe_trigger_no_weather_recovery(wlan, sock)
                 continue
 
             compact_weather = parse_obs_st(packet_obj)
             if compact_weather is None:
-                continue
-
-            if not is_fresh_observation(compact_weather):
+                register_healthy_no_weather_progress()
+                wlan, sock = maybe_trigger_no_weather_recovery(wlan, sock)
                 continue
 
             if not may_forward_now():
+                register_healthy_no_weather_progress()
+                wlan, sock = maybe_trigger_no_weather_recovery(wlan, sock)
                 continue
 
-            print("Parsed fresh obs_st:", compact_weather)
+            print("Parsed obs_st:", compact_weather)
+
             send_weather_to_rak(compact_weather)
+            commit_forward_success()
+            reset_no_weather_counter()
+            feed_watchdog()
+            sent_weather_this_cycle = True
+
             consecutive_main_loop_failures = 0
 
-        except OSError:
-            # Normal socket timeout
-            pass
+        except OSError as e:
+            if is_socket_timeout_error(e):
+                # Normal listener timeout: loop is still healthy, but no weather sent
+                register_healthy_no_weather_progress()
+                wlan, sock = maybe_trigger_no_weather_recovery(wlan, sock)
+            else:
+                consecutive_main_loop_failures += 1
+                print("Socket error:", e)
+
+                try:
+                    sock = recreate_udp_listener(sock, UDP_PORT)
+                except Exception as sock_e:
+                    print("Socket recreate failed:", sock_e)
+
+                if consecutive_main_loop_failures >= MAX_CONSECUTIVE_MAIN_LOOP_FAILURES:
+                    print("Too many main loop/socket failures. Rebooting Pico...")
+                    time.sleep(2)
+                    machine.reset()
+
+                time.sleep(1)
+
         except Exception as e:
             consecutive_main_loop_failures += 1
             print("Main loop error:", e)
