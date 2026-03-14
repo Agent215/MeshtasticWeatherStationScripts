@@ -5,10 +5,10 @@ This repository contains the garden-side bridge code for a self-hosted weather s
 The implemented code today focuses on the Raspberry Pi Pico W in the garden:
 
 - Listen for local WeatherFlow Tempest UDP broadcasts on the garden LAN
-- Extract the key `obs_st` weather fields
-- Validate and compact the payload
+- Extract the key `obs_st` weather fields and preserve the Tempest observation timestamp
+- Validate and compact the payload while rate-limiting outbound weather messages
 - Forward the result over UART to a Meshtastic/RAK node
-- Emit periodic heartbeat/status messages
+- Emit heartbeat/status messages and recover from stalled/no-weather conditions
 
 The broader system described in the documentation extends that path to a home Meshtastic node, a Raspberry Pi gateway, local SQLite storage, and AWS delivery.
 
@@ -65,22 +65,27 @@ It does the following:
   - wind direction
   - rain accumulation for the interval
 - Rejects malformed or out-of-range readings
-- Suppresses duplicate or stale observations using the source timestamp
 - Limits forwarding to one weather message per 60 seconds
+- Includes the Tempest source timestamp in each forwarded weather payload
 - Sends compact newline-delimited JSON over UART at `115200` baud
-- Sends a heartbeat/status JSON message every 6 hours
-- Attempts Wi-Fi recovery and reboots the Pico after repeated unrecoverable failures
+- Sends a heartbeat/status JSON message every 6 hours with uptime, IP, and no-weather counter data
+- Enables the RP2040 watchdog after Wi-Fi and UDP startup completes
+- Uses staged recovery if the main loop stays healthy but no weather is forwarded:
+  - recreate the UDP socket after 60 no-weather cycles
+  - force a Wi-Fi reconnect after 120 no-weather cycles
+  - reboot the Pico after 180 no-weather cycles
+- Recreates the UDP listener after Wi-Fi reconnects and after recoverable socket/main-loop errors
 
 Weather payload sent over UART:
 
 ```json
-{"i":17,"t":22.5,"h":52,"p":1011.4,"w":3.4,"d":230,"r":0.0}
+{"i":17,"ts":1741985112,"t":22.5,"h":52,"p":1011.4,"w":3.4,"d":230,"r":0.0}
 ```
 
 Heartbeat payload sent over UART:
 
 ```json
-{"sys":"ok","i":18,"up":21600,"ip":"192.168.1.205"}
+{"sys":"ok","i":18,"up":21600,"ip":"192.168.1.205","nw":14}
 ```
 
 ### `mock_tempest_sender.py`
@@ -209,8 +214,9 @@ Pico GND      -> RAK GND
 Implemented in this repo:
 
 - Pico W UDP listener and UART bridge
-- Compact outbound weather payload format
+- Compact outbound weather payloads with source timestamps
 - Heartbeat/status payloads from the Pico
+- Watchdog-backed staged recovery for no-weather and connectivity faults
 - Mock Tempest UDP sender for testing
 
 Specified in docs but not implemented here yet:
