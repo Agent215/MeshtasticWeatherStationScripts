@@ -2,7 +2,7 @@
 
 System design and interface specification for Emmas Court Community Garden weather station
 
-# **Revision History** {#revision-history}
+# Revision History
 
 | Date | Editor | Change |
 | :---- | :---- | :---- |
@@ -20,58 +20,37 @@ System design and interface specification for Emmas Court Community Garden weath
 |  |  |  |
 |  |  |  |
 
-[Revision History	2](#revision-history)
+## Table of Contents
 
-[1\. Scope and design goals	4](#1.-scope-and-design-goals)
-
-[2\. Final recommended architecture	4](#2.-final-recommended-architecture)
-
-[3\. Hardware bill of materials	5](#3.-hardware-bill-of-materials)
-
-[4\. Antenna and connector notes for the RAK nodes	6](#4.-antenna-and-connector-notes-for-the-rak-nodes)
-
-[5\. Interface specification: every device-to-device link	6](#5.-interface-specification:-every-device-to-device-link)
-
-[6\. Data models and packet formats	8](#6.-data-models-and-packet-formats)
-
-[6.1 Tempest UDP packets consumed by the Pico	8](#6.1-tempest-udp-packets-consumed-by-the-pico)
-
-[6.2 Pico to Meshtastic payload format	8](#6.2-pico-to-meshtastic-payload-format)
-
-[6.3 Home gateway parsing model	8](#6.3-home-gateway-parsing-model)
-
-[7\. Power architecture	8](#7.-power-architecture)
-
-[8\. Home gateway design	9](#8.-home-gateway-design)
-
-[9\. Bench bring-up plan before adding the Pico	9](#9.-bench-bring-up-plan-before-adding-the-pico)
-
-[10\. Pico integration plan	10](#10.-pico-integration-plan)
-
-[11\. Known implementation notes from the current bench test	10](#11.-known-implementation-notes-from-the-current-bench-test)
-
-[12\. AWS side (intentionally lightweight for now)	11](#12.-aws-side-\(intentionally-lightweight-for-now\))
-
-[12.1 Backend Overview	11](#12.1-backend-overview)
-
-[12.2 Functional Requirements	11](#12.2-functional-requirements)
-
-[12.3 Recommended AWS Services	12](#12.3-recommended-aws-services)
-
-[1\. API Gateway HTTP API	12](#1.-api-gateway-http-api)
-
-[2\. AWS Lambda	12](#2.-aws-lambda)
-
-[3\. Amazon DynamoDB	13](#3.-amazon-dynamodb)
-
-[4\. CloudWatch	14](#4.-cloudwatch)
-
-[13\. Open items and recommended next actions	14](#13.-open-items-and-recommended-next-actions)
+- [Revision History](#revision-history)
+- [1. Scope and design goals](#1-scope-and-design-goals)
+- [2. Final recommended architecture](#2-final-recommended-architecture)
+- [3. Hardware bill of materials](#3-hardware-bill-of-materials)
+- [4. Antenna and connector notes for the RAK nodes](#4-antenna-and-connector-notes-for-the-rak-nodes)
+- [5. Interface specification: every device-to-device link](#5-interface-specification-every-device-to-device-link)
+- [6. Data models and packet formats](#6-data-models-and-packet-formats)
+- [6.1 Tempest UDP packets consumed by the Pico](#61-tempest-udp-packets-consumed-by-the-pico)
+- [6.2 Pico to Meshtastic payload format](#62-pico-to-meshtastic-payload-format)
+- [6.3 Home gateway parsing model](#63-home-gateway-parsing-model)
+- [7. Power architecture](#7-power-architecture)
+- [8. Home gateway design](#8-home-gateway-design)
+- [9. Bench bring-up plan before adding the Pico](#9-bench-bring-up-plan-before-adding-the-pico)
+- [10. Pico integration plan](#10-pico-integration-plan)
+- [11. Known implementation notes from the current bench test](#11-known-implementation-notes-from-the-current-bench-test)
+- [12. AWS side (intentionally lightweight for now)](#12-aws-side-intentionally-lightweight-for-now)
+- [12.1 Backend Overview](#121-backend-overview)
+- [12.2 Functional Requirements](#122-functional-requirements)
+- [12.3 Recommended AWS Services](#123-recommended-aws-services)
+- [1. API Gateway HTTP API](#1-api-gateway-http-api)
+- [2. AWS Lambda](#2-aws-lambda)
+- [3. Amazon DynamoDB](#3-amazon-dynamodb)
+- [4. CloudWatch](#4-cloudwatch)
+- [13. Open items and recommended next actions](#13-open-items-and-recommended-next-actions)
 
 | Recommended build in one sentence: Use a Tempest hub on a private garden Wi-Fi LAN, read the hub’s local UDP broadcast on a Pico W, send compact weather packets over UART to a garden Meshtastic node, relay them over LoRa to a home Meshtastic node, then connect the home node to a Raspberry Pi over USB for forwarding to AWS. |
 | :---- |
 
-# **1\. Scope and design goals** {#1.-scope-and-design-goals}
+# 1. Scope and design goals
 
 This document defines the recommended implementation for a self-hosted garden weather station with no direct internet service at the garden.
 
@@ -83,7 +62,7 @@ Primary goals are: reliable local weather acquisition, low-power off-grid operat
 * Use USB from the home Meshtastic node to a Raspberry Pi gateway at the house.  
 * Support staged testing: node-to-node radio first, mock weather payloads second, real Tempest packets third, AWS integration last.
 
-# **2\. Final recommended architecture** {#2.-final-recommended-architecture}
+# 2. Final recommended architecture
 
 The system is intentionally split into two independent halves. The garden half is responsible for sensing, local packet collection, and radio uplink. The home half is responsible for packet reception, gateway processing, and onward delivery to AWS. This separation keeps the garden node simple and power-efficient while putting the internet-facing logic in the house where power and debugging access are easy.
 
@@ -100,7 +79,7 @@ The system is intentionally split into two independent halves. The garden half i
 
 *Figure 1\. Recommended architecture from garden node to AWS-backed website.*
 
-# **3\. Hardware bill of materials** {#3.-hardware-bill-of-materials}
+# 3. Hardware bill of materials
 
 The table below reflects the currently recommended hardware stack, including decisions made after reviewing the RAK starter kit contents and power-input options.
 
@@ -117,7 +96,7 @@ The table below reflects the currently recommended hardware stack, including dec
 | Power | 12 V to 5 V buck converter | 1 | Garden low-voltage rail | Feeds Tempest hub, router, Pico, and RAK node via USB-C/5 V rail. |
 | RF option | U.FL/MHF1 to RP-SMA pigtail \+ 902-928 MHz blade antenna | optional | Outdoor antenna upgrade | Replaces the stock LoRa antenna on the LoRa U.FL port for the final installation if more range margin is needed. |
 
-# **4\. Antenna and connector notes for the RAK nodes** {#4.-antenna-and-connector-notes-for-the-rak-nodes}
+# 4. Antenna and connector notes for the RAK nodes
 
 The RAK starter kit includes three relevant RF accessories observed during unboxing: a flat LoRa antenna labeled for 902-928 MHz, a BLE antenna, and a small SMA-style pigtail. These do not all connect at the same time.
 
@@ -128,7 +107,7 @@ The RAK starter kit includes three relevant RF accessories observed during unbox
 | Important: Only one antenna may be connected to the LoRa port at a time. For bench tests, keep the stock flat LoRa antenna installed. For the final outdoor build, remove the flat LoRa antenna, install the SMA pigtail on the LoRa port, and connect the external 902-928 MHz antenna to the pigtail. |
 | :---- |
 
-# **5\. Interface specification: every device-to-device link** {#5.-interface-specification:-every-device-to-device-link}
+# 5. Interface specification: every device-to-device link
 
 This section explicitly defines how each device communicates with the device immediately before or after it. This is the critical systems-engineering view of the build and should be treated as the source of truth during implementation.
 
@@ -144,9 +123,9 @@ This section explicitly defines how each device communicates with the device imm
 | Raspberry Pi \<-\> AWS | Home internet connection | HTTPS | Bidirectional request/response | POST latest weather payloads to API endpoint | Keep cloud auth and internet-facing logic on the house side, not in the garden node. |
 | Website \<-\> AWS API | Internet | HTTPS GET / JSON | Request/response | Simple polling is recommended initially | WebSockets can be added later if desired but are not required for MVP. |
 
-# **6\. Data models and packet formats** {#6.-data-models-and-packet-formats}
+# 6. Data models and packet formats
 
-## **6.1 Tempest UDP packets consumed by the Pico** {#6.1-tempest-udp-packets-consumed-by-the-pico}
+## 6.1 Tempest UDP packets consumed by the Pico
 
 The Pico should start by listening for any packet on UDP 50222, then narrow to the specific message types used by the application. For the MVP, the most important are the full observation packet and the rapid wind packet.
 
@@ -155,7 +134,7 @@ The Pico should start by listening for any packet on UDP 50222, then narrow to t
 
 Suggested MVP field extraction from obs\_st: timestamp, average wind, wind direction, pressure, temperature, humidity, and rain amount. The rapid\_wind packet can be used later if the site needs more frequent wind updates than the one-minute observation cadence.
 
-## **6.2 Pico to Meshtastic payload format** {#6.2-pico-to-meshtastic-payload-format}
+## 6.2 Pico to Meshtastic payload format
 
 During early bring-up, use short numbered plain-text messages such as pico-test-0001. Once the UART and radio chain is proven, switch to a compact JSON payload. Keep the payload small and stable so debugging on the home gateway remains easy.
 
@@ -164,11 +143,11 @@ During early bring-up, use short numbered plain-text messages such as pico-test-
 
 Recommended UART framing rule for bench testing: one JSON object per line terminated by a newline. This makes it easy to print, log, and replay traffic during debugging.
 
-## **6.3 Home gateway parsing model** {#6.3-home-gateway-parsing-model}
+## 6.3 Home gateway parsing model
 
 The Raspberry Pi should treat the home Meshtastic node as the source of received packets. The gateway service should log raw packets first, then parse JSON second, then hand the parsed object to storage or AWS upload logic. This layered approach makes field-level bugs easier to isolate.
 
-# **7\. Power architecture** {#7.-power-architecture}
+# 7. Power architecture
 
 The garden node should be designed around a primary 12 V solar battery bus, with a regulated 5 V rail created by a buck converter. This matches the actual power requirements discovered during hardware review: the RAK board can be powered from USB-C, the Tempest hub is a 5 V device, and the router is a 5 V device. The RAK board’s onboard solar and battery JST connectors are useful for tiny standalone Meshtastic nodes but are not the best center of power management for the larger garden system.
 
@@ -185,7 +164,7 @@ The garden node should be designed around a primary 12 V solar battery bus, with
 
 A practical installation target is a single high-quality 5 V buck converter with enough current margin for all 5 V garden electronics together. A 5 V / 5 A converter is a comfortable starting point for the garden enclosure.
 
-# **8\. Home gateway design** {#8.-home-gateway-design}
+# 8. Home gateway design
 
 The home node should connect to a Raspberry Pi by USB-C. This is the recommended permanent interface for the house-side gateway because it provides power and a stable host connection at the same time. Bluetooth should remain available for app-based configuration, but USB is the right operational link for a long-running receiver service.
 
@@ -194,7 +173,7 @@ The home node should connect to a Raspberry Pi by USB-C. This is the recommended
 * Run a small Python service on the Raspberry Pi that logs received packets, parses weather payloads, and writes the latest reading to local storage before uploading to AWS.  
 * Do not rely on the app’s Nodes list as the only health signal. Bench testing showed that messages can pass even while node metadata or displayed names lag behind.
 
-# **9\. Bench bring-up plan before adding the Pico** {#9.-bench-bring-up-plan-before-adding-the-pico}
+# 9. Bench bring-up plan before adding the Pico
 
 Bench bring-up is now partially complete: both RAK nodes have been configured with the United States region, a matching private channel, and message passing was confirmed from home-node to garden-node. The next steps below formalize the recommended test sequence going forward.
 
@@ -207,7 +186,7 @@ Bench bring-up is now partially complete: both RAK nodes have been configured wi
 | E | Local weather input | Add the Pico and Tempest hub/router to replace the mock payload generator. | Real UDP weather fields arrive through the same end-to-end path. |
 | F | Cloud handoff | Add AWS upload and website retrieval last. | Gateway can post latest observation to AWS and the website can retrieve it. |
 
-# **10\. Pico integration plan** {#10.-pico-integration-plan}
+# 10. Pico integration plan
 
 Start with mocked traffic before attempting Tempest integration. This is the lowest-risk path because it proves the UART framing and the radio chain independently of the weather source.
 
@@ -219,7 +198,7 @@ Start with mocked traffic before attempting Tempest integration. This is the low
 
 The onboard Pico LED is sufficient for the first visible transmit indicator. A short blink after every UART write is recommended so the bench operator has an immediate local sign that the Pico code reached its transmit step.
 
-# **11\. Known implementation notes from the current bench test** {#11.-known-implementation-notes-from-the-current-bench-test}
+# 11. Known implementation notes from the current bench test
 
 * Meshtastic app permissions on Android can block discovery if Bluetooth / nearby-device permissions are not granted.  
 * Saving node configuration can appear stuck at 0% if the Bluetooth link hangs; cancel, reconnect, and retry rather than waiting indefinitely.  
@@ -227,9 +206,9 @@ The onboard Pico LED is sufficient for the first visible transmit indicator. A s
 * Friendly node names may lag behind and fall back to a short identifier until node metadata fully refreshes.  
 * Actual message exchange is a more trustworthy radio-health signal than the Nodes list during early bring-up.
 
-# **12\. AWS side (intentionally lightweight for now)** {#12.-aws-side-(intentionally-lightweight-for-now)}
+# 12. AWS side (intentionally lightweight for now)
 
-## **12.1 Backend Overview** {#12.1-backend-overview}
+## 12.1 Backend Overview
 
 The weather station cloud backend should use a lightweight, low-cost, secure serverless architecture in AWS. The system is not intended to be public-facing at scale and is expected to have only one or two trusted clients, primarily the home Raspberry Pi and optionally a website or dashboard for viewing current conditions and history.
 
@@ -248,7 +227,7 @@ This design provides the following benefits:
 
 This architecture is preferred over a traditional EC2-hosted API because the workload is extremely small, intermittent, and predictable. It is also simpler and cheaper than using AWS IoT Core for this initial version
 
-## **12.2 Functional Requirements** {#12.2-functional-requirements}
+## 12.2 Functional Requirements
 
 The cloud API must support two primary operations:
 
@@ -272,9 +251,9 @@ The initial system should optimize for:
 * low cost  
 * straightforward security
 
-## **12.3 Recommended AWS Services** {#12.3-recommended-aws-services}
+## 12.3 Recommended AWS Services
 
-### **1\. API Gateway HTTP API** {#1.-api-gateway-http-api}
+### 1. API Gateway HTTP API
 
 API Gateway should expose the HTTPS endpoints used by the Raspberry Pi and viewer clients.
 
@@ -291,7 +270,7 @@ Why HTTP API:
 * sufficient for this use case  
 * supports IAM authorization for write endpoints
 
-### **2\. AWS Lambda** {#2.-aws-lambda}
+### 2. AWS Lambda
 
 Lambda functions should implement the API logic.
 
@@ -316,7 +295,7 @@ Lambda is appropriate because:
 * no server maintenance is required  
 * it integrates cleanly with API Gateway and DynamoDB
 
-### **3\. Amazon DynamoDB** {#3.-amazon-dynamodb}
+### 3. Amazon DynamoDB
 
 DynamoDB should store both time-series weather data and the latest reading.
 
@@ -335,7 +314,7 @@ A second pattern should also be used for fast current reads:
 
 For this project, a single table with a special latest item is usually sufficient and simpler.
 
-### **4\. CloudWatch** {#4.-cloudwatch}
+### 4. CloudWatch
 
 CloudWatch should be used for:
 
@@ -345,7 +324,7 @@ CloudWatch should be used for:
 
 Logging should be kept minimal to control cost.
 
-# **13\. Open items and recommended next actions** {#13.-open-items-and-recommended-next-actions}
+# 13. Open items and recommended next actions
 
 1. Connect the home RAK node to a Raspberry Pi over USB and verify the Pi can enumerate and communicate with it.  
 2. Receive the Pico and bench-test UART-only mock messages before adding the Tempest hub.  
