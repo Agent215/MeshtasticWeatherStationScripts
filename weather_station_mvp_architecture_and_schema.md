@@ -1,164 +1,191 @@
-# Weather Station MVP: SQLite Schema, Home Server Code, and AWS Schema
+# Weather Station MVP Architecture and Schema Guide
 
-Prepared from the currently provided MVP code and design docs.
+Updated after direct review of `storage.py`.
+
+This document explains the current working MVP as represented by the uploaded code and templates. It focuses on three things:
+
+1. the **SQLite database schema** on the home Raspberry Pi,
+2. the **home server code path** that ingests Meshtastic packets and forwards them to AWS, and
+3. the **AWS schema and infrastructure** used to accept, store, deduplicate, and read observations.
+
+---
 
 ## Files reviewed
 
-### Design / requirements docs
+### Design and requirements
 - `weather_station_ai_handoff.docx`
 - `home_pi_server_design_spec.docx`
 - `weather_station_design_revised_v2 (2).docx`
 
-### Home / edge code
+### Home-side Python code
 - `listen_meshtastic.py`
 - `parser.py`
 - `db.py`
-- `queue_worker.py`
 - `schema.sql`
-- `main.py` (Pico W UDP -> UART bridge; included because it defines the payloads the home server receives)
-- `mock_tempest_udp_sender.py` (test generator for Tempest-style UDP)
+- `storage.py`
+- `queue_worker.py`
 
-### AWS code / infra
+### Garden-side producer and test utilities
+- `main.py`
+- `mock_tempest_udp_sender.py`
+
+### AWS infrastructure and Lambda code
 - `weather-station-stack.yaml`
 - `packaged-template.yaml`
-- `app.py` (AWS ingest Lambda)
-- `appRead.py` (AWS read Lambda)
-
-## Important note about one missing file
-
-The home-side scripts import a `storage.py` module, but that file was **not** present in the uploaded files I could inspect directly. Because of that, the storage-layer behavior in this document is reconstructed from:
-
-- `schema.sql`
-- `db.py`
-- the functions that call storage (`listen_meshtastic.py` and `queue_worker.py`)
-- the design documents
-
-That reconstruction is strong enough to explain the architecture and the database behavior, but where I describe the exact behavior of `insert_weather`, `insert_health`, `record_ingest_event`, `fetch_pending_deliveries`, `mark_delivery_success`, and `mark_delivery_failure`, I am inferring from the surrounding code and schema rather than quoting the missing implementation.
+- `app.py`
+- `appRead.py`
 
 ---
 
-# 1. Executive summary
+## 1. MVP in one pass
 
-This MVP is a two-stage pipeline:
-
-1. **Garden side**: a Pico W listens for Tempest UDP broadcasts, extracts weather values, and emits a compact JSON payload over UART to a Meshtastic radio.
-2. **Home side**: a Raspberry Pi listens to Meshtastic text messages over USB serial, parses and validates them, stores accepted packets in **SQLite**, and later forwards pending weather readings to AWS.
-3. **Cloud side**: API Gateway sends requests to Lambda, and Lambda writes to a single **DynamoDB** table that stores observations, the latest reading, and dedupe markers.
-
-The key reliability pattern is:
-
-- **SQLite is the local source of truth on the home server**.
-- **DynamoDB is the cloud copy / serving layer**.
-- The queue worker gives the system **at-least-once delivery** to AWS.
-- AWS is built to tolerate duplicates by using a dedupe item keyed by station and message id.
-
----
-
-# 2. End-to-end data flow
-
-## 2.1 Physical and logical path
+The system is a store-and-forward pipeline.
 
 ```text
 Tempest sensor
   -> Tempest hub
-  -> UDP broadcast on local LAN (port 50222)
-  -> Pico W (`main.py`)
-  -> UART JSON to garden Meshtastic node
-  -> LoRa / Meshtastic mesh
+  -> UDP broadcast on local LAN
+  -> Pico W bridge
+  -> compact JSON over UART
+  -> garden Meshtastic node
+  -> LoRa / Meshtastic
   -> home Meshtastic node
   -> USB serial to Raspberry Pi
-  -> `listen_meshtastic.py`
-  -> `parser.py`
-  -> SQLite (`schema.sql` via storage layer)
-  -> `queue_worker.py`
-  -> HTTPS POST /observations
-  -> API Gateway
-  -> ingest Lambda (`app.py`)
-  -> DynamoDB (`WeatherObservations`)
-
-View path:
-Browser / site / trusted client
-  -> GET /observations/latest or GET /observations
-  -> API Gateway
-  -> read Lambda (`appRead.py`)
+  -> listen_meshtastic.py
+  -> parser.py
+  -> storage.py + SQLite
+  -> queue_worker.py
+  -> AWS HTTP API
+  -> ingest Lambda
   -> DynamoDB
 ```
 
-## 2.2 Reliability model
+A second read path exists for the website or any viewer:
 
-The MVP uses a classic **store-and-forward** pattern:
+```text
+Viewer / website
+  -> GET /observations/latest or GET /observations
+  -> API Gateway
+  -> read Lambda
+  -> DynamoDB
+```
 
-- Home ingest does not try to post directly to AWS before saving locally.
-- Weather messages are first committed to SQLite.
-- A separate queue worker polls for pending deliveries.
-- Failed cloud posts stay in the queue and are retried.
-- Cloud-side writes are idempotent from the station/message-id perspective.
+The most important architectural rule in the MVP is this:
 
-That means temporary AWS outages should not cause data loss as long as the Raspberry Pi and SQLite database remain healthy.
+- **SQLite is the local system of record.**
+- **AWS is the downstream serving layer.**
+- **Weather is saved locally first, then delivered to AWS later.**
+
+That design is what gives the system resilience when the internet or AWS is unavailable.
 
 ---
 
-# 3. The home-side codebase: what each script does
+## 2. Home-side runtime architecture
 
-## 3.1 `listen_meshtastic.py`: the ingest daemon
+There are really two long-running home-side processes.
 
-This is the Raspberry Pi process that listens to the home Meshtastic node over USB serial.
+### Process 1: `listen_meshtastic.py`
+This is the ingest daemon.
 
-### Main responsibilities
+Its job is to:
+- connect to the home Meshtastic node over USB serial,
+- receive inbound packets,
+- extract the text payload,
+- parse and classify the payload,
+- write valid data into SQLite.
 
+### Process 2: `queue_worker.py`
+This is the cloud delivery daemon.
+
+Its job is to:
+- poll SQLite for readings that have not yet been delivered,
+- transform them into the AWS API payload shape,
+- POST them to the AWS API,
+- mark success or schedule retry in SQLite.
+
+Together they implement a durable pipeline:
+
+```text
+Meshtastic packet received
+  -> saved locally
+  -> queued for delivery
+  -> retried until AWS accepts it
+```
+
+---
+
+## 3. Home-side code, file by file
+
+### 3.1 `listen_meshtastic.py`
+
+This script is the entry point for home-side ingestion.
+
+#### What it does
+- Builds a base path under `~/weatherstation-home`.
+- Adds `~/weatherstation-home/weatherstation` to `sys.path`.
+- Imports:
+  - `parse_text_payload` from `parser.py`
+  - `insert_health`, `insert_weather`, and `record_ingest_event` from `storage.py`
 - Opens a Meshtastic serial connection using `meshtastic.serial_interface.SerialInterface`.
-- Subscribes to pubsub topics:
+- Subscribes to pubsub events:
   - `meshtastic.receive`
   - `meshtastic.connection.established`
   - `meshtastic.connection.lost`
-- Extracts packet metadata such as:
-  - `fromId`
-  - node long/short name
-  - `toId`
-  - `portnum`
-  - RF metadata like RSSI / SNR / hop count
-- Decodes the inbound text payload.
-- Hands text payloads to `parser.py`.
-- Writes successful results to SQLite through the missing `storage.py` layer.
-- Reconnects automatically if the Meshtastic USB serial connection drops.
+- Reconnects in a loop if the serial connection drops.
 
-### Packet handling model
+#### What packets it actually processes
+It logs all received packets, but only parses packets when:
 
-The script is intentionally conservative:
+- `decoded.portnum == "TEXT_MESSAGE_APP"`
 
-- It logs every received packet.
-- It only tries to parse application payloads when `portnum == "TEXT_MESSAGE_APP"`.
-- Telemetry packets are noticed and logged, but not inserted into the weather database.
+If the packet is `TELEMETRY_APP`, it logs that it saw it, but does not try to store it as weather.
 
-### High-level flow inside `process_text_packet`
+#### How payload text is extracted
+The script first looks for:
+- `decoded["text"]`
+
+If that is absent, it falls back to:
+- `decoded["payload"]`
+
+and decodes bytes to UTF-8 if needed.
+
+#### How source metadata is captured
+It extracts:
+- `fromId` as `source_node_id`
+- `user.longName` or `user.shortName` as `source_name`
+
+That means the SQLite records can carry both a stable node id and a friendly node name when Meshtastic exposes one.
+
+#### Processing flow
+Once a text payload is extracted, the flow is:
 
 ```text
-Received packet
-  -> decode payload text
+process_text_packet()
   -> parse_text_payload(...)
-  -> if weather:
+  -> if packet_type == weather:
        insert_weather(parsed)
-       if duplicate: record_ingest_event(parsed)
-     elif health:
+       if duplicate:
+         record_ingest_event(parsed)
+     elif packet_type == health:
        insert_health(parsed)
      else:
        record_ingest_event(parsed)
 ```
 
-### Operational behavior
+#### Important behavior
+- Empty text payloads are skipped and logged.
+- Parse exceptions are caught and logged.
+- Storage exceptions are caught and logged.
+- The service is designed to keep running rather than crash on bad packets.
 
-- Handles `SIGINT` and `SIGTERM` for clean shutdown.
-- Loops forever while `RUNNING` is true.
-- On connection error, waits 5 seconds and reconnects.
-- Produces JSON log lines suitable for `journalctl` or log collection.
+---
 
-## 3.2 `parser.py`: packet classification, normalization, and validation
+### 3.2 `parser.py`
 
-This is the boundary where raw Meshtastic text becomes structured application data.
+This file is where raw text becomes structured events.
 
-### Output model
-
-The parser returns a `ParsedEvent` dataclass with:
+#### Core datatype: `ParsedEvent`
+The parser returns a `ParsedEvent` dataclass with these fields:
 
 - `packet_type`
 - `reason`
@@ -170,25 +197,21 @@ The parser returns a `ParsedEvent` dataclass with:
 - `raw_payload`
 - `normalized`
 
-### Supported packet classes
+This structure is used by `storage.py` for inserts.
 
-#### 1. `weather`
-Triggered when the JSON object contains the required keys:
+#### Supported packet types
 
-- `i` = message id
-- `t` = temperature C
-- `h` = humidity %
-- `p` = pressure hPa
-- `w` = wind m/s
-- `d` = wind direction degrees
-- `r` = rain mm
+##### `weather`
+A payload is classified as weather when it contains all of these keys:
+- `i`
+- `t`
+- `h`
+- `p`
+- `w`
+- `d`
+- `r`
 
-Optional:
-
-- `ts` = source timestamp
-
-The parser normalizes this to:
-
+Those are normalized into:
 - `msg_id`
 - `temp_c`
 - `humidity_pct`
@@ -198,20 +221,20 @@ The parser normalizes this to:
 - `rain_mm`
 - `source_ts_utc`
 
-Validation ranges implemented in code:
+Validation ranges enforced by the parser are:
+- temperature: `-60` to `70`
+- humidity: `0` to `100`
+- pressure: `800` to `1200`
+- wind: `0` to `100`
+- wind direction: `0` to `360`
+- rain: `0` to `500`
 
-- temp: `-60 .. 70`
-- humidity: `0 .. 100`
-- pressure: `800 .. 1200`
-- wind: `0 .. 100`
-- wind direction: `0 .. 360`
-- rain: `0 .. 500`
+If conversion or validation fails, the parser returns `packet_type="rejected"`.
 
-#### 2. `health`
-Triggered when the JSON object contains `sys`.
+##### `health`
+A payload is classified as health when it contains `sys`.
 
-Normalized fields:
-
+Normalized health fields are:
 - `status`
 - `msg_id`
 - `uptime_sec`
@@ -219,145 +242,263 @@ Normalized fields:
 - `error_reason`
 - `source_ts_utc`
 
-This means any payload shaped like:
+If health parsing fails, the parser returns `packet_type="invalid"` with a reason beginning `bad_health_payload:`.
 
-```json
-{"sys":"dbg","i":123,"up":900,"ip":"192.168.1.50"}
-```
-
-will be treated as a health/status event.
-
-#### 3. `invalid`
+##### `invalid`
 Used when:
+- JSON cannot be parsed,
+- JSON is not an object,
+- health parsing fails.
 
-- JSON parsing fails
-- JSON is not an object
-- health parsing fails
+##### `rejected`
+Used when the payload looks like weather, but numeric conversion or range validation fails.
 
-Examples of reasons:
+##### `unknown`
+Used when the JSON is valid, but does not match either the weather or health contract.
 
-- `malformed_json`
-- `json_not_object`
-- `bad_health_payload:<exception>`
+#### Important implementation detail
+The parser currently recognizes only the **core compact weather fields**. The richer Pico payload also includes fields like gust, lull, UV, solar radiation, illuminance, lightning, battery, and precipitation analysis fields, but those are not normalized into `ParsedEvent.normalized` for weather. In the current MVP, those extra values are dropped at the parser boundary even though the Pico sends them.
 
-#### 4. `rejected`
-Used when the weather payload has the right general shape but fails numeric conversion or range validation.
+---
 
-#### 5. `unknown`
-Used when the payload is valid JSON but does not match the known weather or health contracts.
+### 3.3 `db.py`
 
-### Important limitation in the current parser
+This file defines how SQLite connections are opened.
 
-The current home parser only stores the **compact weather core**:
-
-- temp
-- humidity
-- pressure
-- average wind
-- wind direction
-- rain
-- source timestamp
-
-It does **not** currently normalize the richer extra fields sent by the latest Pico bridge, such as:
-
-- gust
-- lull
-- UV
-- solar radiation
-- illuminance
-- lightning fields
-- battery voltage
-- precipitation analysis fields
-
-Those values exist upstream and the AWS Lambda can validate them, but the current parser/schema path does not yet persist them locally.
-
-## 3.3 `db.py`: SQLite connection helper
-
-This file is very small but important. It centralizes database connection behavior.
-
-### What it does
-
-- Builds the DB path as:
+#### Database location
+The database path is hardcoded as:
 
 ```text
 ~/weatherstation-home/weatherstation/weatherstation.db
 ```
 
-- Opens a SQLite connection.
-- Sets `row_factory = sqlite3.Row` so rows can be addressed by column name.
-- Enables foreign keys.
-- Enables WAL journal mode.
+#### Connection behavior
+Each connection:
+- uses `sqlite3.Row` as the row factory,
+- enables `PRAGMA foreign_keys=ON`,
+- enables `PRAGMA journal_mode=WAL`.
 
-### Why this matters
+#### Why that matters
+- `sqlite3.Row` allows code to access columns by name instead of numeric index.
+- `foreign_keys=ON` enforces integrity between `aws_delivery_queue` and `weather_readings`.
+- `WAL` mode is a strong fit for a small service app with concurrent reads and writes.
 
-- **`foreign_keys=ON`** ensures queue rows cannot reference nonexistent weather readings.
-- **WAL mode** is a good fit here because it improves concurrent read/write behavior and reduces locking pain for a service-style app.
+#### Important note
+The design docs mention an environment-configurable path, but the current MVP code does **not** use one. The path is fixed in code.
 
-### Note on config drift
+---
 
-The design spec suggests an environment-configurable `SQLITE_PATH`, but the current uploaded `db.py` hardcodes the database location under the home directory. That is a meaningful difference between the design docs and the actual MVP code.
+### 3.4 `storage.py`
 
-## 3.4 `queue_worker.py`: durable delivery worker
+This file is the heart of the local persistence layer. It is the most important bridge between parsed events and the SQLite schema.
 
-This is the second major home-side process. It reads pending weather rows from SQLite and POSTs them to AWS.
+It provides the following functions:
+- `record_ingest_event()`
+- `insert_weather()`
+- `insert_health()`
+- `fetch_pending_deliveries()`
+- `mark_delivery_success()`
+- `mark_delivery_failure()`
 
-### Main responsibilities
+It also defines:
+- `utc_now()`
+- `compute_next_attempt()`
 
-- Loads API settings from environment / `.env`:
-  - `API_URL`
-  - `API_KEY`
-- Polls SQLite for pending deliveries.
-- Builds the outbound API request body.
-- Sends `POST /observations` with `x-weatherstation-key`.
-- Retries transient HTTP/network failures.
-- Marks queue rows as success or failure in SQLite.
-- Emits structured logs.
-- Optionally notifies systemd via native notify socket support.
+#### 3.4.1 `record_ingest_event(event, packet_type_override=None, reason_override=None)`
 
-### Worker loop behavior
+This writes a row into the `ingest_events` table.
+
+It stores:
+- `received_at_utc`
+- `source_node_id`
+- `source_name`
+- `packet_type`
+- `reason`
+- `msg_id`
+- `raw_payload`
+
+This is used for packets that were seen but not stored as weather or health, and also for duplicates.
+
+#### 3.4.2 `insert_weather(event)`
+
+This function inserts accepted weather into the local durable store and queues it for AWS delivery.
+
+##### What it requires
+It requires `event.normalized` to exist and it requires `source_ts_utc` to be present and non-empty.
+
+If `source_ts_utc` is missing, it raises:
+- `ValueError("weather_missing_source_ts_utc")`
+
+That means the current home-side pipeline will **not** store weather rows that do not contain a source timestamp.
+
+##### Insert behavior
+It inserts a row into `weather_readings` with:
+- `source_node_id`
+- `source_name`
+- `msg_id`
+- `source_ts_utc`
+- `received_at_utc`
+- `temp_c`
+- `humidity_pct`
+- `pressure_hpa`
+- `wind_ms`
+- `wind_dir_deg`
+- `rain_mm`
+- `raw_payload`
+- `payload_hash`
+
+The payload hash is computed with SHA-256 over the raw payload string.
+
+##### Duplicate behavior
+If the insert triggers `sqlite3.IntegrityError`, `insert_weather()` returns:
+- `"duplicate"`
+
+It does **not** raise the error up as fatal.
+
+The listener then logs and records the duplicate as an ingest event.
+
+##### Queue behavior
+If the weather row is inserted successfully, `insert_weather()` immediately inserts a row into:
+- `aws_delivery_queue`
+
+with:
+- `reading_id`
+- `status = 'pending'`
+
+##### Current-status behavior
+It also upserts into `device_status_current`, setting:
+- `source_node_id`
+- `source_name`
+- `last_weather_at_utc`
+- `last_msg_id`
+- `last_source_ts_utc`
+- `updated_at_utc`
+
+It does **not** compute `derived_state`.
+
+##### Return value
+- `"inserted"` on success
+- `"duplicate"` on uniqueness conflict
+
+#### 3.4.3 `insert_health(event)`
+
+This inserts a health/status packet into `device_health_events` and updates the current snapshot table.
+
+##### Inserted history fields
+It stores:
+- `source_node_id`
+- `source_name`
+- `msg_id`
+- `source_ts_utc`
+- `received_at_utc`
+- `status`
+- `uptime_sec`
+- `ip_address`
+- `error_reason`
+- `raw_payload`
+
+##### Current snapshot update
+It upserts into `device_status_current`, setting:
+- `source_name`
+- `last_health_at_utc`
+- `last_status`
+- `last_msg_id`
+- `last_source_ts_utc`
+- `last_uptime_sec`
+- `last_ip_address`
+- `updated_at_utc`
+
+Again, it does **not** compute or update `derived_state`.
+
+#### 3.4.4 `compute_next_attempt(attempt_count)`
+
+This function defines the local SQLite retry schedule.
+
+The schedule is:
+- attempt 1 -> retry after **30 seconds**
+- attempt 2 -> retry after **120 seconds**
+- attempt 3 -> retry after **600 seconds**
+- attempt 4 and beyond -> retry after **1800 seconds**
+
+This is the retry schedule written into SQLite when delivery fails.
+
+#### 3.4.5 `fetch_pending_deliveries(limit=10)`
+
+This query joins `aws_delivery_queue` to `weather_readings` and returns rows that are ready to be posted.
+
+It selects rows where:
+- `status IN ('pending', 'retry')`
+- and `next_attempt_at_utc IS NULL` or already due
+
+It orders them by queue id ascending and limits the result count.
+
+##### Returned columns
+The query returns these values:
+- `queue_id`
+- `reading_id`
+- `status`
+- `attempt_count`
+- `next_attempt_at_utc`
+- `source_node_id`
+- `source_name`
+- `msg_id`
+- `source_ts_utc`
+- `received_at_utc`
+- `temp_c`
+- `humidity_pct`
+- `pressure_hpa`
+- `wind_ms`
+- `wind_dir_deg`
+- `rain_mm`
+- `raw_payload`
+
+This is important because it means the current queue worker only has access to the **basic local weather columns**. Even though `queue_worker.py` knows how to build a richer AWS payload, the current storage query does not provide those richer columns.
+
+#### 3.4.6 `mark_delivery_success(queue_id)`
+
+On success, the queue row is updated to:
+- `status = 'delivered'`
+- `delivered_at_utc = CURRENT_TIMESTAMP`
+- `last_attempt_at_utc = CURRENT_TIMESTAMP`
+- `updated_at_utc = CURRENT_TIMESTAMP`
+- `last_error = NULL`
+
+#### 3.4.7 `mark_delivery_failure(queue_id, error)`
+
+On failure, the function:
+- loads the current `attempt_count`,
+- increments it,
+- computes `next_attempt_at_utc` using `compute_next_attempt()`,
+- truncates the stored error string to 500 chars,
+- updates the queue row to:
+  - `status = 'retry'`
+  - new `attempt_count`
+  - new `next_attempt_at_utc`
+  - `last_attempt_at_utc = CURRENT_TIMESTAMP`
+  - `updated_at_utc = CURRENT_TIMESTAMP`
+  - `last_error = truncated error`
+
+There is no terminal `failed` state in the current implementation. A failed row remains retryable forever unless the code or data is changed manually.
+
+---
+
+### 3.5 `queue_worker.py`
+
+This is the outbound AWS delivery worker.
+
+#### Configuration
+It loads settings from `.env` or environment variables:
+- `API_URL`
+- `API_KEY`
+
+The `.env` path is computed as:
 
 ```text
-startup
-  -> load config
-  -> every 5 seconds:
-       fetch up to 10 pending rows
-       for each row:
-         build API payload
-         POST to AWS with retry
-         if success: mark_delivery_success(queue_id)
-         else:       mark_delivery_failure(queue_id, error)
+<repo parent>/.env
 ```
 
-### Retry behavior
-
-Retryable HTTP statuses are:
-
-- `429`
-- `500`
-- `502`
-- `503`
-- `504`
-
-Also retryable:
-
-- `URLError`
-- timeout
-
-Non-retryable errors include other HTTP errors such as most validation failures or auth failures.
-
-Backoff schedule per attempt:
-
-- attempt 1 failure -> 2 seconds
-- attempt 2 failure -> 4 seconds
-- attempt 3 failure -> 8 seconds
-- attempt 4 failure -> 16 seconds
-- attempt 5 failure -> capped at 30 seconds
-
-Maximum tries per processing cycle: **5**.
-
-### Outbound payload shape
-
-`queue_worker.py` converts SQLite rows into:
+#### What it sends
+For each pending delivery row it builds:
 
 ```json
 {
@@ -379,180 +520,160 @@ Maximum tries per processing cycle: **5**.
 }
 ```
 
-### Future-ready mapping
+It normalizes `received_at_utc` so that `+00:00` becomes `Z` before sending to AWS.
 
-The worker already knows how to forward many richer fields if they exist in the DB row, including:
+#### HTTP behavior
+It POSTs to:
+- `API_URL + "/observations"`
 
-- `wind_lull_ms`
-- `wind_gust_ms`
-- `wind_sample_interval_s`
-- `illuminance_lux`
-- `uv_index`
-- `solar_radiation_wm2`
-- `precipitation_type`
-- `lightning_avg_distance_km`
-- `lightning_strike_count`
-- `battery_voltage_v`
-- `report_interval_min`
-- `local_day_rain_mm`
-- `nearcast_rain_mm`
-- `local_day_nearcast_rain_mm`
-- `precipitation_analysis_type`
-- `timestamp`
+and sends the header:
+- `x-weatherstation-key: API_KEY`
 
-However, the current `schema.sql` does **not** define columns for those richer fields in `weather_readings`, so in the current MVP most of those values will only be forwarded if the storage layer is synthesizing them from somewhere else. Most likely they are simply absent today and get dropped by `drop_none()`.
+#### Retryable errors inside the worker loop
+These are considered retryable:
+- HTTP `429`
+- HTTP `500`
+- HTTP `502`
+- HTTP `503`
+- HTTP `504`
+- network errors
+- timeouts
 
-### Systemd integration
+Other HTTP errors are treated as non-retryable for that processing attempt, but note the important interaction with `storage.py`:
+- `process_one()` catches **all** exceptions,
+- then calls `mark_delivery_failure(queue_id, str(exc))`.
 
-The worker implements a small native `SystemdNotifier` class that supports:
+So even non-retryable application errors still end up in local queue state as `status='retry'`. The distinction in `queue_worker.py` mainly affects the **in-process immediate retry loop**, not whether the row will ever be retried later by SQLite.
 
+#### Immediate retry schedule inside the worker
+Inside a single processing cycle, the worker may retry up to 5 times with exponential backoff:
+- 2 seconds
+- 4 seconds
+- 8 seconds
+- 16 seconds
+- capped at 30 seconds
+
+That is separate from the longer SQLite retry schedule in `storage.py`.
+
+So there are really **two retry layers**:
+
+1. **Immediate in-memory retry** inside `queue_worker.py`
+2. **Deferred persistent retry** via `aws_delivery_queue.next_attempt_at_utc`
+
+#### Systemd support
+The worker includes native support for `NOTIFY_SOCKET` and watchdog pings. It can emit:
 - `READY=1`
 - `STATUS=...`
 - `STOPPING=1`
 - `WATCHDOG=1`
 
-So if the final unit file uses `Type=notify` and systemd watchdog settings, the worker is already prepared for that.
+That makes it suitable for a `Type=notify` systemd unit.
 
-### Note on config drift
+---
 
-The design docs describe variables like `AWS_API_URL` and `AWS_API_KEY`, but the actual uploaded worker looks for:
+### 3.6 `main.py` on the Pico W
 
-- `API_URL`
-- `API_KEY`
+This file runs on the Pico and defines what the home server receives.
 
-That is another real difference between the design docs and the current MVP implementation.
+#### Core behavior
+- Connects to Wi-Fi
+- Disables Wi-Fi power saving
+- Listens on UDP port `50222`
+- Accepts Tempest `obs_st` packets
+- Validates and rate-limits them
+- Sends a compact JSON line over UART
+- Sends debug heartbeat packets every 15 minutes
+- Rebuilds the socket or reconnects Wi-Fi if no UDP is seen for long enough
 
-## 3.5 `main.py`: Pico W producer context
-
-This is not part of the home server, but it matters because it defines what the home server receives.
-
-### What it does
-
-- Connects Pico W to Wi-Fi.
-- Disables Wi-Fi power save.
-- Listens on UDP port `50222`.
-- Parses Tempest `obs_st` packets.
-- Performs sanity validation.
-- Rate-limits forwarding to once per 60 seconds.
-- Sends compact JSON over UART to the RAK/Meshtastic node.
-- Sends periodic debug heartbeats every 15 minutes.
-- Performs staged recovery when no UDP has been seen for too long.
-
-### Weather fields the Pico currently emits
-
-The current weather payload contains more than the home parser uses:
-
-- `i` message id
-- `ts` source timestamp
-- `t` temperature
-- `h` humidity
-- `p` pressure
-- `w` average wind
-- `g` wind gust
-- `l` wind lull
-- `d` wind direction
-- `r` rain interval
+#### Weather payload it emits
+The Pico emits many more fields than the home parser currently stores:
+- `i`
+- `ts`
+- `t`
+- `h`
+- `p`
+- `w`
+- `g`
+- `l`
+- `d`
+- `r`
 - `uv`
-- `sr` solar radiation
+- `sr`
 - `lux`
 - `bat`
-- `ld` lightning distance
-- `lc` lightning count
-- `pt` precipitation type
-- `ri` report interval
-- `rd` local day rain
-- `nr` nearcast rain
-- `nrd` local day nearcast rain
-- `pa` precipitation analysis type
+- `ld`
+- `lc`
+- `pt`
+- `ri`
+- `rd`
+- `nr`
+- `nrd`
+- `pa`
 
-### Debug heartbeat shape
-
-The health/debug payload includes:
-
+#### Health/debug heartbeat
+The Pico heartbeat includes:
 - `sys`
 - `i`
 - `up`
 - `ip`
-- `wc`
-- `pm`
-- `udp`
-- `jerr`
-- `nobs`
-- `rej`
-- `skip`
-- `sockrec`
-- `wifirec`
-- `sockerr`
-- `nwu`
-- `last_udp_s`
-- `last_obs_s`
-- `last_ok_s`
+- and many extra debug counters
 
-The home parser currently only normalizes `sys`, `i`, `up`, `ip`, `err`, and `ts`, so the other debug values are effectively ignored unless the missing storage layer preserves raw payloads for later inspection.
-
-## 3.6 `mock_tempest_udp_sender.py`: local test utility
-
-This script generates fake but plausible Tempest `obs_st` packets and sends them over UDP.
-
-Why it matters:
-
-- It lets you test the Pico bridge without real weather hardware.
-- It confirms the exact upstream packet shape the Pico expects.
-- It provides a reproducible path for bench testing the entire ingest pipeline.
+The home parser only normalizes a subset of the heartbeat fields. The raw payload is still stored for health events, so the extra fields are not totally lost, but they are not promoted into dedicated columns.
 
 ---
 
-# 4. SQLite database: how it works
+### 3.7 `mock_tempest_udp_sender.py`
 
-## 4.1 Why SQLite is used here
+This is a local dev/test utility that emits realistic `obs_st` UDP packets.
 
-SQLite is the home-side durable store and queue. That means it is doing three jobs at once:
+It exists to test the Pico bridge without requiring the real Tempest hub.
 
-1. **Primary local record of accepted weather readings**
-2. **Retry queue for AWS delivery**
-3. **Operational telemetry store for health/status and rejected packets**
+It is useful because it reproduces the upstream field shape that the Pico expects, including:
+- wind lull, avg, gust,
+- direction,
+- pressure,
+- temp,
+- humidity,
+- light,
+- UV,
+- solar radiation,
+- rain,
+- lightning,
+- battery,
+- report interval,
+- nearcast fields.
 
-This is a good MVP choice because it is:
+---
 
-- simple to deploy
-- durable on disk
-- fast enough for tiny traffic volume
-- transactional
-- easy to inspect manually
+## 4. SQLite schema overview
 
-## 4.2 Database-wide settings from `schema.sql`
+The local SQLite database has five main jobs:
 
-Before tables are created, the schema sets:
+1. store accepted weather readings,
+2. queue those readings for AWS delivery,
+3. store health/status history,
+4. store a one-row-per-device latest snapshot,
+5. store invalid, rejected, unknown, or duplicate ingest events for debugging.
+
+Before any tables are created, `schema.sql` enables:
 
 ```sql
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 ```
 
-### What those do
-
-- **WAL mode**:
-  - SQLite writes go to a write-ahead log first.
-  - This improves concurrency for service apps.
-  - Readers are less likely to block writers.
-
-- **Foreign keys ON**:
-  - SQLite will enforce referential integrity.
-  - For example, a queue row cannot legally point at a weather reading that does not exist.
+That gives better service-style behavior and proper relational integrity.
 
 ---
 
-# 5. Detailed SQLite schema reference
+## 5. Detailed SQLite schema reference
 
 ## 5.1 `weather_readings`
 
 ### Purpose
+Stores one row per accepted weather observation.
 
-This is the main table for accepted weather observations.
-
-Each row represents one weather reading received from a Meshtastic source node and accepted by the parser/storage layer.
-
-### DDL
+### Schema
 
 ```sql
 CREATE TABLE IF NOT EXISTS weather_readings (
@@ -575,45 +696,35 @@ CREATE TABLE IF NOT EXISTS weather_readings (
 );
 ```
 
-### Column-by-column explanation
+### Column explanations
 
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | Internal SQLite surrogate key. Used by other tables, especially the delivery queue. |
-| `source_node_id` | `TEXT NOT NULL` | Meshtastic node id of the sender, such as `!5c32d4d9`. This identifies the station/source. |
-| `source_name` | `TEXT` | Optional human-readable sender name if Meshtastic metadata provided one. |
-| `msg_id` | `INTEGER NOT NULL` | Message id generated on the garden side. Used for tracing and possibly dedupe logic. |
-| `source_ts_utc` | `TEXT NOT NULL` | Timestamp from the originating source payload, not when the Pi received it. In the current flow this usually comes from the Pico's `ts` field and may be an epoch string. |
-| `received_at_utc` | `TEXT NOT NULL` | When the home server received and processed the packet. |
-| `temp_c` | `REAL NOT NULL` | Air temperature in Celsius. |
-| `humidity_pct` | `REAL NOT NULL` | Relative humidity percentage. |
-| `pressure_hpa` | `REAL NOT NULL` | Station pressure in hectopascals. |
-| `wind_ms` | `REAL NOT NULL` | Wind speed in meters per second. In the current parser this is average wind. |
-| `wind_dir_deg` | `INTEGER NOT NULL` | Wind direction in degrees, 0-360. |
-| `rain_mm` | `REAL NOT NULL` | Rain amount in millimeters for the interval represented by the packet. |
-| `raw_payload` | `TEXT NOT NULL` | Original JSON payload string as received over Meshtastic. Very useful for debugging and future reprocessing. |
-| `payload_hash` | `TEXT` | SHA-256 hash of the raw payload. Can support dedupe, diagnostics, or tamper checking. |
-| `created_at_utc` | `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP` | When SQLite inserted the row locally. |
+| Column | Meaning |
+|---|---|
+| `id` | Internal SQLite surrogate key. Used by the delivery queue. |
+| `source_node_id` | Meshtastic sender id, such as `!abcd1234`. |
+| `source_name` | Optional node display name. |
+| `msg_id` | Garden-side message id from the packet. Useful for tracing and cloud dedupe. |
+| `source_ts_utc` | Source-origin timestamp from the payload. Required by `storage.py`. In practice this may be an epoch string from the Pico. |
+| `received_at_utc` | Timestamp when the home Pi received and parsed the message. |
+| `temp_c` | Air temperature in Celsius. |
+| `humidity_pct` | Relative humidity percent. |
+| `pressure_hpa` | Station pressure in hPa. |
+| `wind_ms` | Wind speed in m/s. In the current parser this is average wind. |
+| `wind_dir_deg` | Wind direction in degrees. |
+| `rain_mm` | Rain for the represented interval in mm. |
+| `raw_payload` | Full original JSON payload as text. Important for debugging and future reprocessing. |
+| `payload_hash` | SHA-256 hash of the raw payload. |
+| `created_at_utc` | Insert timestamp generated by SQLite. |
 
 ### Uniqueness rule
+The table deduplicates on:
+- `UNIQUE(source_node_id, source_ts_utc)`
 
-```sql
-UNIQUE(source_node_id, source_ts_utc)
-```
+That means local dedupe is based on **source node + source timestamp**, not source node + message id.
 
-This is important: the actual schema dedupes on **source node + source timestamp**, not source node + message id.
+This is one of the most important implementation details in the MVP.
 
-That differs from the design doc, which proposed deduping by `(source_node_id, msg_id)`.
-
-### Likely meaning of that choice
-
-This suggests the current MVP is treating the source timestamp as the true natural key for a weather observation. That works if the garden source emits one reading per source timestamp.
-
-Potential downside:
-
-- if two distinct messages accidentally share the same source timestamp, one could be considered a duplicate.
-
-### Indexes on this table
+### Indexes
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_weather_received_at
@@ -626,21 +737,19 @@ CREATE INDEX IF NOT EXISTS idx_weather_source_msg
 ON weather_readings(source_node_id, msg_id);
 ```
 
-#### What each index is for
+These support:
+- recent history queries,
+- per-device history queries,
+- station + msg id troubleshooting.
 
-- `idx_weather_received_at`: efficient recent-history scans by receive time
-- `idx_weather_source_received`: efficient per-station history lookups
-- `idx_weather_source_msg`: efficient lookups by station + message id for debugging or dedupe helpers
+---
 
 ## 5.2 `aws_delivery_queue`
 
 ### Purpose
+Tracks whether each saved weather reading has been delivered to AWS.
 
-This table tracks whether each saved weather reading has been delivered to AWS.
-
-It is the backbone of the at-least-once delivery model.
-
-### DDL
+### Schema
 
 ```sql
 CREATE TABLE IF NOT EXISTS aws_delivery_queue (
@@ -659,27 +768,24 @@ CREATE TABLE IF NOT EXISTS aws_delivery_queue (
 );
 ```
 
-### Column-by-column explanation
+### Column explanations
 
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | Internal queue row id. This is what `queue_worker.py` logs as `queue_id`. |
-| `reading_id` | `INTEGER NOT NULL` | Foreign key to `weather_readings.id`. Each queue row corresponds to one accepted weather reading. |
-| `status` | `TEXT NOT NULL DEFAULT 'pending'` | Delivery state. In practice this is likely values such as `pending`, `delivered`, and possibly retry/failure states depending on `storage.py`. |
-| `attempt_count` | `INTEGER NOT NULL DEFAULT 0` | Number of AWS delivery attempts recorded so far. |
-| `next_attempt_at_utc` | `TEXT` | Earliest time a failed row should be retried. This supports deferred retry scheduling. |
-| `last_attempt_at_utc` | `TEXT` | Timestamp of the most recent AWS delivery attempt. |
-| `delivered_at_utc` | `TEXT` | Timestamp when AWS delivery succeeded. |
-| `last_error` | `TEXT` | Most recent error message from an AWS delivery failure. |
-| `created_at_utc` | `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP` | When the queue row was created. Usually immediately after weather row insertion. |
-| `updated_at_utc` | `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP` | Last time the queue row was changed. |
+| Column | Meaning |
+|---|---|
+| `id` | Internal queue row id, logged by the worker as `queue_id`. |
+| `reading_id` | Foreign key to `weather_readings.id`. |
+| `status` | Delivery state. In the current code, the meaningful values are `pending`, `retry`, and `delivered`. |
+| `attempt_count` | Number of persisted delivery failures recorded so far. |
+| `next_attempt_at_utc` | Earliest time the row should be retried. |
+| `last_attempt_at_utc` | Timestamp of the most recent delivery attempt. |
+| `delivered_at_utc` | Timestamp when AWS delivery succeeded. |
+| `last_error` | Most recent failure text, truncated to 500 chars by `storage.py`. |
+| `created_at_utc` | Queue row creation timestamp. |
+| `updated_at_utc` | Queue row last update timestamp. |
 
-### Constraints and behavior
-
-- `FOREIGN KEY(reading_id) ... ON DELETE CASCADE`:
-  - deleting a weather reading will automatically delete its queue entry
-- `UNIQUE(reading_id)`:
-  - one weather reading can only have one queue row
+### Constraints
+- `reading_id` is unique, so one weather reading gets one queue row.
+- `ON DELETE CASCADE` means deleting the weather row removes its queue row too.
 
 ### Index
 
@@ -688,30 +794,16 @@ CREATE INDEX IF NOT EXISTS idx_delivery_status_next_attempt
 ON aws_delivery_queue(status, next_attempt_at_utc, id);
 ```
 
-This is designed for the worker query pattern:
+This supports the worker’s polling query efficiently.
 
-- find rows with a deliverable status
-- whose `next_attempt_at_utc` is due
-- process them in a stable order
-
-### Likely storage-layer behavior
-
-Because `queue_worker.py` calls `fetch_pending_deliveries(limit=10)`, the missing storage layer likely does something like:
-
-- join `aws_delivery_queue` to `weather_readings`
-- return rows where `status = 'pending'`
-- and `next_attempt_at_utc` is null or due
-- ordered by queue id or time
+---
 
 ## 5.3 `device_health_events`
 
 ### Purpose
+Stores every accepted health/status packet as historical telemetry.
 
-Stores inbound health/debug/status packets from the garden side.
-
-This is operational telemetry, not business weather data.
-
-### DDL
+### Schema
 
 ```sql
 CREATE TABLE IF NOT EXISTS device_health_events (
@@ -730,22 +822,22 @@ CREATE TABLE IF NOT EXISTS device_health_events (
 );
 ```
 
-### Column-by-column explanation
+### Column explanations
 
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | Internal row id. |
-| `source_node_id` | `TEXT NOT NULL` | Meshtastic sender id for the device that emitted the health packet. |
-| `source_name` | `TEXT` | Optional sender name. |
-| `msg_id` | `INTEGER` | Optional health message id. |
-| `source_ts_utc` | `TEXT` | Optional timestamp from the originating device payload. |
-| `received_at_utc` | `TEXT NOT NULL` | When the Pi received the health packet. |
-| `status` | `TEXT NOT NULL` | Health/status string from the `sys` field, such as `ok`, `warn`, `error`, or in the current Pico debug build, `dbg`. |
-| `uptime_sec` | `INTEGER` | Device uptime in seconds if present. |
-| `ip_address` | `TEXT` | Device IP address reported by the garden-side sender if present. |
-| `error_reason` | `TEXT` | Optional error detail from the `err` field. |
-| `raw_payload` | `TEXT NOT NULL` | Original JSON health packet. |
-| `created_at_utc` | `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP` | Insert time in SQLite. |
+| Column | Meaning |
+|---|---|
+| `id` | Internal row id. |
+| `source_node_id` | Node that sent the health/status packet. |
+| `source_name` | Optional friendly node name. |
+| `msg_id` | Optional packet sequence/message id. |
+| `source_ts_utc` | Optional originating timestamp from the payload. |
+| `received_at_utc` | When the Pi received it. |
+| `status` | Value from `sys`, such as `dbg`, `ok`, `warn`, or `error`. |
+| `uptime_sec` | Device uptime if present. |
+| `ip_address` | Current IP if present. |
+| `error_reason` | Optional error text from `err`. |
+| `raw_payload` | Full original JSON health payload. |
+| `created_at_utc` | Insert time in SQLite. |
 
 ### Index
 
@@ -754,17 +846,18 @@ CREATE INDEX IF NOT EXISTS idx_health_source_received
 ON device_health_events(source_node_id, received_at_utc);
 ```
 
-This supports per-device health history and “latest health” lookups.
+This supports health history by device and recent event lookup.
+
+---
 
 ## 5.4 `device_status_current`
 
 ### Purpose
+Stores the latest known state snapshot for each source node.
 
-This is the latest-known state snapshot for each source node.
+This is a denormalized convenience table so code does not have to scan all history tables to answer “what is the latest known state of this device?”
 
-Instead of scanning all event history each time, the app can update one current-state row per source.
-
-### DDL
+### Schema
 
 ```sql
 CREATE TABLE IF NOT EXISTS device_status_current (
@@ -782,41 +875,35 @@ CREATE TABLE IF NOT EXISTS device_status_current (
 );
 ```
 
-### Column-by-column explanation
+### Column explanations
 
-| Column | Type | Meaning |
-|---|---|---|
-| `source_node_id` | `TEXT PRIMARY KEY` | One row per device/source node. This is the key of the current-status snapshot. |
-| `source_name` | `TEXT` | Optional human-readable node name. |
-| `last_weather_at_utc` | `TEXT` | Timestamp of the latest accepted weather reading for this source. |
-| `last_health_at_utc` | `TEXT` | Timestamp of the latest health packet for this source. |
-| `last_status` | `TEXT` | Raw latest health status string, e.g. `ok`, `dbg`, `warn`, `error`. |
-| `derived_state` | `TEXT` | Computed operational state such as `healthy`, `degraded`, `offline`, or `bad_health`. |
-| `last_msg_id` | `INTEGER` | Latest seen message id, probably from either health or weather depending on storage logic. |
-| `last_source_ts_utc` | `TEXT` | Latest source-side timestamp seen from the device. |
-| `last_uptime_sec` | `INTEGER` | Latest reported uptime in seconds. |
-| `last_ip_address` | `TEXT` | Latest reported IP address. |
-| `updated_at_utc` | `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP` | When this current-state row was last updated. |
+| Column | Meaning |
+|---|---|
+| `source_node_id` | Primary key. One row per device/source. |
+| `source_name` | Friendly node name if known. |
+| `last_weather_at_utc` | Last accepted weather packet receive time. |
+| `last_health_at_utc` | Last accepted health packet receive time. |
+| `last_status` | Latest raw `sys` value. |
+| `derived_state` | Reserved for higher-level state such as `healthy`, `offline`, etc. |
+| `last_msg_id` | Most recent message id seen. |
+| `last_source_ts_utc` | Most recent source-origin timestamp seen. |
+| `last_uptime_sec` | Most recent uptime reported by health packet. |
+| `last_ip_address` | Most recent IP reported by health packet. |
+| `updated_at_utc` | Last update timestamp for this snapshot row. |
 
-### How it likely works
+### Important implementation note
+The table contains `derived_state`, but **current `storage.py` never sets it**. So the column exists, but the MVP is not yet deriving health/offline/degraded state locally.
 
-Although the storage implementation is missing, the natural behavior would be:
-
-- on weather insert: update `last_weather_at_utc`, maybe `last_msg_id`, maybe `last_source_ts_utc`
-- on health insert: update `last_health_at_utc`, `last_status`, `last_uptime_sec`, `last_ip_address`
-- compute `derived_state` based on freshness and status
-
-This matches the design spec even though the exact update function is not visible.
+---
 
 ## 5.5 `ingest_events`
 
 ### Purpose
+Stores packets that were seen during ingest but were not stored as accepted weather rows or accepted health rows.
 
-Stores packets that were seen by the listener but **not** accepted as valid weather rows or health rows.
+This is the diagnostics and audit table for bad or unusual traffic.
 
-This is a diagnostics table.
-
-### DDL
+### Schema
 
 ```sql
 CREATE TABLE IF NOT EXISTS ingest_events (
@@ -832,19 +919,19 @@ CREATE TABLE IF NOT EXISTS ingest_events (
 );
 ```
 
-### Column-by-column explanation
+### Column explanations
 
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | Internal event row id. |
-| `received_at_utc` | `TEXT NOT NULL` | When the home server saw the packet. |
-| `source_node_id` | `TEXT` | Source node id if known. |
-| `source_name` | `TEXT` | Source node name if known. |
-| `packet_type` | `TEXT NOT NULL` | Parser classification such as `invalid`, `rejected`, `unknown`, or possibly duplicate-related bookkeeping. |
-| `reason` | `TEXT` | Why it was rejected or categorized, such as `malformed_json` or `unrecognized_payload_shape`. |
-| `msg_id` | `INTEGER` | Message id if one could be extracted. |
-| `raw_payload` | `TEXT` | Original text payload for debugging. |
-| `created_at_utc` | `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP` | Insert time. |
+| Column | Meaning |
+|---|---|
+| `id` | Internal row id. |
+| `received_at_utc` | When the Pi saw the packet. |
+| `source_node_id` | Source device id if known. |
+| `source_name` | Source device name if known. |
+| `packet_type` | Parser classification such as `invalid`, `rejected`, `unknown`, or duplicate bookkeeping. |
+| `reason` | Why it was classified that way. |
+| `msg_id` | Message id if extractable. |
+| `raw_payload` | Raw packet text. |
+| `created_at_utc` | Insert time. |
 
 ### Index
 
@@ -853,469 +940,315 @@ CREATE INDEX IF NOT EXISTS idx_ingest_received
 ON ingest_events(received_at_utc);
 ```
 
-This supports recent-error inspection and troubleshooting timelines.
-
 ---
 
-# 6. How the SQLite pieces work together
+## 6. How the SQLite tables work together
 
-## 6.1 Valid weather packet path
-
-Likely flow:
+### Successful weather flow
 
 ```text
-listener receives TEXT_MESSAGE_APP
-  -> parser classifies packet as weather
-  -> storage inserts row into weather_readings
-  -> storage inserts/ensures one row in aws_delivery_queue
-  -> storage updates device_status_current
+valid weather packet received
+  -> parser returns packet_type=weather
+  -> insert into weather_readings
+  -> insert pending row into aws_delivery_queue
+  -> update device_status_current with latest weather timestamps/msg ids
 ```
 
-## 6.2 Duplicate weather packet path
-
-Likely flow:
+### Duplicate weather flow
 
 ```text
-listener receives weather packet
-  -> storage detects duplicate based on schema uniqueness or helper logic
-  -> no second weather row inserted
-  -> listener records ingest event for visibility
+duplicate weather packet received
+  -> weather_readings insert hits UNIQUE(source_node_id, source_ts_utc)
+  -> insert_weather returns "duplicate"
+  -> listen_meshtastic.py records an ingest_events row
 ```
 
-## 6.3 Health packet path
-
-Likely flow:
+### Health flow
 
 ```text
-listener receives health packet
-  -> parser classifies as health
-  -> storage inserts into device_health_events
-  -> storage updates device_status_current
+valid health packet received
+  -> parser returns packet_type=health
+  -> insert into device_health_events
+  -> update device_status_current with latest health values
 ```
 
-## 6.4 Invalid / unknown packet path
-
-Likely flow:
+### Invalid / rejected / unknown flow
 
 ```text
-listener receives packet
-  -> parser returns invalid / rejected / unknown
-  -> no weather row inserted
-  -> no queue row inserted
-  -> ingest_events row inserted for diagnostics
+packet seen but not accepted
+  -> parser returns invalid/rejected/unknown
+  -> record_ingest_event()
+  -> row saved in ingest_events
 ```
 
-## 6.5 Successful AWS delivery path
-
-Likely flow:
+### Delivery success flow
 
 ```text
-queue worker fetches pending row
-  -> POST to AWS succeeds
+queue worker posts reading to AWS successfully
   -> mark_delivery_success(queue_id)
-  -> queue row status becomes delivered
-  -> delivered_at_utc populated
+  -> status becomes delivered
+  -> delivered_at_utc is set
 ```
 
-## 6.6 Failed AWS delivery path
-
-Likely flow:
+### Delivery failure flow
 
 ```text
-queue worker fetches pending row
-  -> POST fails
+queue worker fails to post reading
   -> mark_delivery_failure(queue_id, error)
   -> attempt_count increments
-  -> last_error updated
   -> next_attempt_at_utc scheduled
-  -> row remains retryable
+  -> status becomes retry
 ```
 
 ---
 
-# 7. AWS infrastructure: how the cloud side is built
+## 7. Important SQLite and ingest semantics
 
-The AWS stack is defined in two YAML files:
+## 7.1 Local dedupe key is timestamp-based
+Locally, a weather reading is deduped by:
+- `source_node_id`
+- `source_ts_utc`
 
-- `weather-station-stack.yaml` = source CloudFormation template
-- `packaged-template.yaml` = deployment-ready packaged version whose Lambda code references S3 objects
+This is different from the design docs, which described deduping by message id.
 
-## 7.1 High-level AWS architecture
+## 7.2 Cloud dedupe key is message-id-based
+In AWS, dedupe is based on:
+- station/source node id
+- `msg_id`
+
+That means local and cloud dedupe are **not using the same natural key**.
+
+### What that implies
+- Two packets with the same `msg_id` but different `source_ts_utc` could both exist locally but be deduped by AWS.
+- Two packets with the same `source_ts_utc` but different `msg_id` would collapse locally before AWS ever sees both.
+
+That mismatch is not necessarily fatal for the MVP, but it is a real design inconsistency and worth fixing later.
+
+## 7.3 Weather packets must have `source_ts_utc`
+Because `insert_weather()` rejects missing timestamps, weather rows without `ts` from the source are not stored.
+
+This is stricter than the parser alone. The parser will happily normalize weather with missing `ts`, but the storage layer will not accept it.
+
+## 7.4 No local derived state yet
+The design docs describe derived states like `healthy`, `degraded`, `offline`, and `bad_health`, but the current storage code does not calculate them. The schema leaves room for it, but the MVP does not implement it.
+
+## 7.5 The raw payload is preserved everywhere important
+This is a strong design choice in the current MVP:
+- accepted weather rows keep `raw_payload`,
+- accepted health rows keep `raw_payload`,
+- rejected/unknown rows keep `raw_payload`.
+
+That makes future debugging and schema evolution much easier.
+
+---
+
+## 8. AWS infrastructure
+
+There are two CloudFormation templates:
+
+- `weather-station-stack.yaml`: the authoring template
+- `packaged-template.yaml`: the deployment-ready packaged template with S3 code references
+
+### High-level AWS architecture
 
 ```text
-API Gateway HTTP API
-  -> POST /observations
-       -> ingest Lambda (`app.py`)
-       -> DynamoDB table
+HTTP API (API Gateway v2)
+  -> POST /observations        -> ingest Lambda
+  -> GET  /observations/latest -> read Lambda
+  -> GET  /observations        -> read Lambda
 
-  -> GET /observations/latest
-       -> read Lambda (`appRead.py`)
-       -> DynamoDB table
-
-  -> GET /observations
-       -> read Lambda (`appRead.py`)
-       -> DynamoDB table
+Both Lambdas use one DynamoDB table.
 ```
 
-## 7.2 CloudFormation parameters
+---
+
+## 9. CloudFormation resources in detail
+
+## 9.1 Parameters
 
 ### `ProjectName`
 Default: `weather-station`
 
-Used to build resource names.
+Used in naming resources.
 
 ### `EnvironmentName`
 Default: `dev`
 
-Lets the same template create different environments such as dev/test/prod.
+Used to produce environment-specific names.
 
 ### `ApiSharedSecret`
-- required secret
 - `NoEcho: true`
 - minimum length 16
 
-This becomes the shared credential expected in the `x-weatherstation-key` header.
+This is the shared secret expected in the `x-weatherstation-key` header.
 
 ### `TableName`
 Default: `WeatherObservations`
 
-Controls the DynamoDB table name.
+Name of the DynamoDB table.
 
 ### `AllowedCorsOrigin`
 Default: `*`
 
-Controls CORS headers emitted by the API/Lambdas.
+Used for API CORS headers.
 
 ---
 
-# 8. AWS resources, one by one
+## 9.2 DynamoDB table: `WeatherObservationsTable`
 
-## 8.1 `WeatherObservationsTable` (DynamoDB)
+The table uses:
+- `BillingMode: PAY_PER_REQUEST`
+- partition key `pk` (string)
+- sort key `sk` (string)
 
-### Table type
+This is a **single-table design**.
 
-```yaml
-Type: AWS::DynamoDB::Table
-BillingMode: PAY_PER_REQUEST
-```
+Different logical record types live together in the same table and are distinguished by key patterns and attributes.
 
-This is a good fit for low, bursty usage because you do not need to provision capacity up front.
+---
 
-### Key schema
-
-- partition key: `pk` (string)
-- sort key: `sk` (string)
-
-This is a **single-table design**. Different logical record types share one table and are distinguished by key patterns and `record_type` attributes.
-
-## 8.2 `WeatherLambdaRole` (IAM role)
+## 9.3 IAM role: `WeatherLambdaRole`
 
 The Lambda role allows:
 
-### DynamoDB permissions
+### DynamoDB actions
+- `GetItem`
+- `PutItem`
+- `Query`
+- `TransactWriteItems`
 
-- `dynamodb:GetItem`
-- `dynamodb:PutItem`
-- `dynamodb:Query`
-- `dynamodb:TransactWriteItems`
+### CloudWatch Logs actions
+- `CreateLogGroup`
+- `CreateLogStream`
+- `PutLogEvents`
 
-### CloudWatch Logs permissions
+That is enough for the current ingest and read Lambdas.
 
-- `logs:CreateLogGroup`
-- `logs:CreateLogStream`
-- `logs:PutLogEvents`
+---
 
-This is close to least privilege for the MVP.
+## 9.4 Lambda functions
 
-## 8.3 `IngestObservationFunction`
+### `IngestObservationFunction`
+Runtime settings:
+- Python 3.13
+- handler `app.handler`
+- 10 second timeout
+- 256 MB memory
+- arm64
 
-### Runtime settings
-
-- runtime: `python3.13`
-- handler: `app.handler`
-- timeout: 10 seconds
-- memory: 256 MB
-- architecture: `arm64`
-
-### Environment variables
-
+Environment variables:
 - `TABLE_NAME`
 - `API_SHARED_SECRET`
 - `ALLOWED_CORS_ORIGIN`
 
-### Code source
+### `ReadObservationFunction`
+Runtime settings:
+- Python 3.13
+- handler `app.handler`
+- 10 second timeout
+- 256 MB memory
+- arm64
 
-In the source template:
-
-```yaml
-Code: ingest/
-```
-
-In the packaged template:
-
-- S3 bucket = `brahm-weather-station-cfn-artifacts-2026`
-- S3 key = packaged artifact id
-
-## 8.4 `ReadObservationFunction`
-
-Similar runtime settings, but environment contains:
-
+Environment variables:
 - `TABLE_NAME`
 - `ALLOWED_CORS_ORIGIN`
 
-No shared secret is needed because the current read routes are not authenticated in the Lambda code.
+### Code packaging note
+In `weather-station-stack.yaml`, the Lambda `Code` values are local directories:
+- `ingest/`
+- `read/`
 
-## 8.5 `WeatherHttpApi`
+In `packaged-template.yaml`, those are replaced with:
+- `S3Bucket`
+- `S3Key`
 
-This is an API Gateway **HTTP API** with CORS configured to allow:
-
-- methods: `GET`, `POST`, `OPTIONS`
-- headers: `content-type`, `x-weatherstation-key`
-
-## 8.6 Integrations and routes
-
-### Routes
-
-- `POST /observations` -> ingest Lambda
-- `GET /observations/latest` -> read Lambda
-- `GET /observations` -> read Lambda
-
-### Stage
-
-- `$default`
-- `AutoDeploy: true`
-
-That means the API is available without an explicit stage name in the URL path.
-
-## 8.7 Lambda invoke permissions
-
-Two `AWS::Lambda::Permission` resources allow API Gateway to invoke the Lambdas.
-
-## 8.8 Outputs
-
-The stack exports:
-
-- `ApiBaseUrl`
-- `TableNameOutput`
-- `IngestFunctionNameOutput`
-- `ReadFunctionNameOutput`
+So `packaged-template.yaml` is the real deployable artifact after packaging.
 
 ---
 
-# 9. DynamoDB schema: how the cloud database works
+## 9.5 API Gateway
 
-DynamoDB is not relational, so it does not have fixed SQL columns in the same way SQLite does. Instead, it stores **items with attributes**.
+The stack creates an API Gateway v2 HTTP API with:
+- `POST /observations`
+- `GET /observations/latest`
+- `GET /observations`
 
-In this MVP, there is one table that stores several logical item types.
+A `$default` stage is created with `AutoDeploy: true`.
 
-## 9.1 Table keys
+CORS allows:
+- methods `GET`, `POST`, `OPTIONS`
+- headers `content-type`, `x-weatherstation-key`
 
-### `pk`
-Partition key.
+### Security note
+The POST endpoint is protected inside the ingest Lambda by checking `x-weatherstation-key`.
 
-Pattern:
-
-```text
-STATION#<source_node_id>
-```
-
-Example:
-
-```text
-STATION#!5c32d4d9
-```
-
-This groups all items for one station together.
-
-### `sk`
-Sort key.
-
-There are three main patterns:
-
-1. observation item
-   ```text
-   OBS#<received_at_utc>#<padded_msg_id>
-   ```
-2. latest item
-   ```text
-   LATEST
-   ```
-3. dedupe item
-   ```text
-   DEDUPE#<padded_msg_id>
-   ```
-
-### Why the sort key format matters
-
-Because `received_at_utc` is an ISO UTC timestamp string, lexical sort order matches chronological order. That makes history queries simple.
-
-The padded message id ensures stable ordering even if two observations share the same timestamp string.
+The GET endpoints are not authenticated in the current Lambda code. That may be intentional for a simple website, but it is worth noting.
 
 ---
 
-# 10. DynamoDB item types in detail
+## 10. AWS ingest Lambda (`app.py`)
 
-## 10.1 Observation item
+This Lambda handles `POST /observations`.
 
-Created for every accepted cloud ingest.
+### Route handling
+It only accepts:
+- `POST /observations`
 
-### Key pattern
-
-- `pk = STATION#<source_node_id>`
-- `sk = OBS#<received_at_utc>#<zero-padded-msg-id>`
-
-### Attributes stored by the ingest Lambda
-
-| Attribute | Meaning |
-|---|---|
-| `pk` | Station partition key |
-| `sk` | Observation sort key |
-| `record_type` | Literal value `observation` |
-| `source_node_id` | Station/source node id |
-| `source_name` | Optional node name |
-| `msg_id` | Integer message id |
-| `source_ts_utc` | Source timestamp from the payload |
-| `received_at_utc` | Home server receive timestamp |
-| `weather` | Nested object of weather fields |
-| `raw_payload` | Entire request body that Lambda received |
-| `ingested_at_utc` | When Lambda stored the record |
-
-### Role of this item type
-
-This is the durable historical record used for history queries.
-
-## 10.2 Latest item
-
-A rolling snapshot of the newest known observation for the station.
-
-### Key pattern
-
-- `pk = STATION#<source_node_id>`
-- `sk = LATEST`
-
-### Attributes stored
-
-| Attribute | Meaning |
-|---|---|
-| `pk` | Station partition key |
-| `sk` | Literal `LATEST` |
-| `record_type` | Literal `latest` |
-| `source_node_id` | Station id |
-| `source_name` | Optional station name |
-| `msg_id` | Message id of the newest reading |
-| `source_ts_utc` | Source timestamp of newest reading |
-| `received_at_utc` | Home receive time of newest reading |
-| `weather` | Nested weather object for newest reading |
-| `latest_observation_sk` | Pointer to the observation item sort key |
-| `updated_at_utc` | When this latest snapshot was refreshed |
-
-### Role of this item type
-
-This makes `GET /observations/latest` a fast point lookup.
-
-## 10.3 Dedupe item
-
-Used to prevent duplicate writes for the same station/message-id combination.
-
-### Key pattern
-
-- `pk = STATION#<source_node_id>`
-- `sk = DEDUPE#<zero-padded-msg-id>`
-
-### Attributes stored
-
-| Attribute | Meaning |
-|---|---|
-| `pk` | Station partition key |
-| `sk` | Dedupe key for a message id |
-| `record_type` | Literal `dedupe` |
-| `source_node_id` | Station id |
-| `msg_id` | Integer message id |
-| `received_at_utc` | Receive time associated with the dedupe marker |
-
-### Role of this item type
-
-The Lambda writes this item first in a DynamoDB transaction with a condition expression:
-
-```text
-attribute_not_exists(pk) AND attribute_not_exists(sk)
-```
-
-If the dedupe item already exists, the transaction is canceled and the Lambda returns:
-
-```json
-{
-  "ok": true,
-  "deduped": true
-}
-```
-
-That is the cloud-side idempotency guarantee.
-
----
-
-# 11. AWS ingest Lambda (`app.py`): detailed behavior
-
-## 11.1 Request contract
-
-The Lambda only accepts:
-
-- method: `POST`
-- path: `/observations`
+`OPTIONS` returns success for CORS.
 
 Anything else returns 404.
 
-## 11.2 Authentication
+### Authentication
+It checks the request header:
+- `x-weatherstation-key`
 
-The request must include:
+and compares it to `API_SHARED_SECRET`.
 
-```http
-x-weatherstation-key: <shared secret>
-```
+If the secret does not match, it returns:
+- `401 unauthorized`
 
-If the secret does not match `API_SHARED_SECRET`, the Lambda returns `401 unauthorized`.
-
-## 11.3 Body parsing
-
-- JSON request body is parsed.
-- If `isBase64Encoded` is true, body is base64-decoded first.
-- Floats are parsed as `Decimal` for accuracy.
-
-## 11.4 Payload validation
-
-The Lambda expects:
+### Expected request body
+It expects a body shaped like:
 
 ```json
 {
   "payload": {
-    "source_node_id": "...",
-    "msg_id": 123,
+    "source_node_id": "!abcd1234",
+    "source_name": "garden",
+    "msg_id": 17,
+    "source_ts_utc": "1773794743",
     "received_at_utc": "2026-03-18T00:45:46.982324Z",
-    "source_name": "optional",
-    "source_ts_utc": "optional",
-    "weather": { ... }
+    "weather": {
+      "air_temp_c": 22.5,
+      "relative_humidity_pct": 52,
+      "station_pressure_hpa": 1011.4,
+      "wind_avg_ms": 3.4,
+      "wind_dir_deg": 230,
+      "rain_interval_mm": 0.0
+    }
   }
 }
 ```
 
-### Required fields
+### Validation rules
+Required top-level payload fields:
+- `source_node_id` must be a string
+- `msg_id` must be present and convertible to int
+- `received_at_utc` must be ISO-8601 UTC with trailing `Z`
 
-- `payload.source_node_id` must be a string
-- `payload.msg_id` must exist and be integer-convertible
-- `payload.received_at_utc` must be ISO-8601 UTC string ending in `Z`
-
-### Optional source timestamp rules
+Optional:
+- `source_name`
+- `source_ts_utc`
 
 `source_ts_utc` may be:
+- epoch string
+- ISO UTC string
+- integer/decimal epoch
 
-- epoch string of digits
-- ISO-8601 UTC string
-- integer / Decimal epoch
+The weather object is validated field by field using `WEATHER_RULES`.
 
-### Weather validation rules
-
-The ingest Lambda is richer than the current home parser. It understands many optional fields, including:
-
+#### Supported validated weather fields
+The Lambda accepts a wider schema than the current home SQLite schema stores. It can validate fields such as:
 - `wind_lull_ms`
 - `wind_avg_ms`
 - `wind_gust_ms`
@@ -1339,314 +1272,219 @@ The ingest Lambda is richer than the current home parser. It understands many op
 - `precipitation_analysis_type`
 - `timestamp`
 
-So the cloud side is already designed to accept a fuller weather model than the current home parser is persisting.
-
-## 11.5 Transaction write behavior
-
-The Lambda uses one `transact_write_items` call containing three writes:
-
-1. Put dedupe item with `attribute_not_exists` guard
-2. Put observation item
-3. Put latest item
-
-This guarantees that:
-
-- you do not get a latest item without an observation
-- you do not get an observation without its dedupe marker
-- duplicate message ids for a station are safely absorbed
-
----
-
-# 12. AWS read Lambda (`appRead.py`): detailed behavior
-
-## 12.1 Supported routes
-
-### `GET /observations/latest`
-
-Required query string:
-
-- `stationId`
-
-Behavior:
-
-- builds `pk = STATION#<stationId>`
-- gets the item with `sk = LATEST`
-- returns 404 if not found
-
-### `GET /observations`
-
-Required query string:
-
-- `stationId`
-- `from`
-- `to`
-
-Optional:
-
-- `limit` (default 200, max 1000)
-
-Behavior:
-
-- builds `pk = STATION#<stationId>`
-- queries sort key range:
-  - from `OBS#<from>`
-  - to `OBS#<to>~`
-- returns newest-first because `ScanIndexForward=False`
-
-The `~` suffix is a common lexical trick so all keys beginning with the `to` timestamp range are included.
-
-## 12.2 Response shape
-
-The read Lambda deserializes DynamoDB attribute values and returns normal JSON.
-
-For history it returns:
-
-```json
-{
-  "ok": true,
-  "count": <n>,
-  "items": [ ... ]
-}
-```
-
-For latest it returns:
-
-```json
-{
-  "ok": true,
-  "item": { ... }
-}
-```
-
----
-
-# 13. Where the current MVP is ahead of the original design
-
-The provided implementation is ahead of the older design docs in a few places.
-
-## 13.1 Richer cloud weather schema
-
-The AWS ingest Lambda already validates many more weather fields than the local home parser currently stores.
-
-## 13.2 Separate worker process instead of one threaded process
-
-The design spec described a single service with a background worker thread. The actual MVP appears to be split into at least two scripts/processes:
-
-- `listen_meshtastic.py`
-- `queue_worker.py`
-
-That is still a valid architecture and may actually be easier to supervise and debug.
-
-## 13.3 Native systemd notify support
-
-`queue_worker.py` already includes systemd notify/watchdog support, which is more production-ready than the earlier design description.
-
----
-
-# 14. Where the current MVP differs from the design docs
-
-These differences are important for future maintenance.
-
-## 14.1 SQLite dedupe key changed
-
-Design doc expectation:
-
-- unique by `(source_node_id, msg_id)`
-
-Actual schema:
-
-- unique by `(source_node_id, source_ts_utc)`
-
-## 14.2 SQLite path config changed
-
-Design doc expectation:
-
-- path configurable via environment
-
-Actual uploaded `db.py`:
-
-- path is hardcoded under `~/weatherstation-home/weatherstation/weatherstation.db`
-
-## 14.3 Environment variable names changed
-
-Design doc expectation:
-
-- `AWS_API_URL`
-- `AWS_API_KEY`
-
-Actual `queue_worker.py`:
-
-- `API_URL`
-- `API_KEY`
-
-## 14.4 Health heartbeat cadence changed
-
-Design doc suggested a 6-hour advisory heartbeat.
-
-Current Pico code sends debug heartbeats every **15 minutes** with `sys = "dbg"`.
-
-## 14.5 Rich weather fields not yet persisted locally
-
-The Pico and AWS sides understand more weather fields than the local parser/schema currently persists.
-
----
-
-# 15. Inferred storage-layer contract (`storage.py`)
-
-Because the file is missing, the best way to explain it is by its implied API.
-
-## 15.1 `insert_weather(parsed)`
-Likely responsibilities:
-
-- insert into `weather_readings`
-- compute/store `payload_hash`
-- create one `aws_delivery_queue` row
-- update `device_status_current`
-- return something like `"duplicate"` when uniqueness prevents insertion
-
-## 15.2 `insert_health(parsed)`
-Likely responsibilities:
-
-- insert into `device_health_events`
-- update `device_status_current`
-- maybe recompute `derived_state`
-
-## 15.3 `record_ingest_event(parsed)`
-Likely responsibilities:
-
-- insert non-primary packets into `ingest_events`
-- preserve `packet_type`, `reason`, `raw_payload`, source info, and `msg_id`
-
-## 15.4 `fetch_pending_deliveries(limit=10)`
-Likely responsibilities:
-
-- query due rows from `aws_delivery_queue`
-- join them with `weather_readings`
-- return the combined row data that `queue_worker.py` expects
-
-The worker expects fields such as:
-
-- `queue_id`
-- `reading_id`
-- `attempt_count`
+So the cloud-side contract is already more future-ready than the local home parser/schema.
+
+### DynamoDB key design
+The Lambda builds:
+- `pk = "STATION#" + source_node_id`
+
+and then three sort keys:
+- observation row: `OBS#<received_at_utc>#<zero-padded msg_id>`
+- latest row: `LATEST`
+- dedupe row: `DEDUPE#<zero-padded msg_id>`
+
+### Items written per accepted observation
+The Lambda writes three logical items in one transaction.
+
+#### 1. Dedupe item
+Used to guarantee idempotency per station and message id.
+
+Fields include:
+- `pk`
+- `sk = DEDUPE#...`
+- `record_type = dedupe`
+- `source_node_id`
+- `msg_id`
+- `received_at_utc`
+
+This item is written with a condition that it must not already exist.
+
+#### 2. Observation item
+The historical time-series record.
+
+Fields include:
+- `pk`
+- `sk = OBS#...`
+- `record_type = observation`
 - `source_node_id`
 - `source_name`
 - `msg_id`
 - `source_ts_utc`
 - `received_at_utc`
-- weather columns
+- `weather`
+- `raw_payload`
+- `ingested_at_utc`
 
-## 15.5 `mark_delivery_success(queue_id)`
-Likely responsibilities:
+#### 3. Latest item
+The current/latest snapshot for the station.
 
-- set `status = delivered`
-- set `delivered_at_utc`
-- update `updated_at_utc`
+Fields include:
+- `pk`
+- `sk = LATEST`
+- `record_type = latest`
+- `source_node_id`
+- `source_name`
+- `msg_id`
+- `source_ts_utc`
+- `received_at_utc`
+- `weather`
+- `latest_observation_sk`
+- `updated_at_utc`
 
-## 15.6 `mark_delivery_failure(queue_id, error)`
-Likely responsibilities:
+### Transaction behavior
+All three items are written in one `TransactWriteItems` call.
 
-- increment `attempt_count`
-- write `last_error`
-- write `last_attempt_at_utc`
-- compute `next_attempt_at_utc`
-- keep row eligible for future retry
+That ensures:
+- the historical observation,
+- the dedupe marker,
+- and the latest snapshot
 
----
+stay consistent.
 
-# 16. Practical interpretation: how both databases relate to each other
+### Deduplication response behavior
+If the transaction throws `TransactionCanceledException`, the Lambda returns:
 
-## SQLite role
+```json
+{
+  "ok": true,
+  "deduped": true,
+  "source_node_id": "...",
+  "msg_id": 17
+}
+```
 
-SQLite is the **operational edge database**.
+This is intended to represent duplicate detection.
 
-It is responsible for:
-
-- durability on the Raspberry Pi
-- temporary disconnection tolerance
-- dedupe / queue control at the edge
-- health and ingest diagnostics
-
-Think of SQLite as the **authoritative local backlog and event journal**.
-
-## DynamoDB role
-
-DynamoDB is the **cloud serving database**.
-
-It is responsible for:
-
-- storing historical observations for the website/API
-- returning the latest observation efficiently
-- deduping repeated uploads from the home server
-
-Think of DynamoDB as the **cloud publication layer**.
-
-## Why the split is good
-
-This split keeps internet failures from affecting local capture.
-
-Even if AWS is down:
-
-- Meshtastic ingest can continue
-- SQLite can keep accepting rows
-- the queue can drain later when the network returns
+### Important implementation note
+The code treats **any** `TransactionCanceledException` as dedupe. In practice that exception could theoretically happen for reasons other than the dedupe condition, though dedupe is the expected reason here.
 
 ---
 
-# 17. Suggested follow-up improvements
+## 11. AWS read Lambda (`appRead.py`)
 
-Based on the current code, these are the highest-value next improvements.
+This Lambda handles:
+- `GET /observations/latest`
+- `GET /observations`
 
-## 17.1 Add the missing `storage.py` to the repo/docs bundle
+### `GET /observations/latest`
+Requires query string:
+- `stationId`
 
-This is the most important documentation gap.
+It performs a `GetItem` with:
+- `pk = STATION#<stationId>`
+- `sk = LATEST`
 
-## 17.2 Align dedupe strategy across edge and cloud
+If found, it returns the normalized item.
 
-Decide whether the canonical observation identity is:
+### `GET /observations`
+Requires query string:
+- `stationId`
+- `from`
+- `to`
 
-- `(source_node_id, msg_id)`
-- or `(source_node_id, source_ts_utc)`
+Optional:
+- `limit` default 200, minimum 1, maximum 1000
 
-Right now SQLite and DynamoDB are using different natural keys.
+It queries:
+- `pk = STATION#<stationId>`
+- `sk BETWEEN OBS#<from> AND OBS#<to>~`
 
-## 17.3 Persist the richer weather fields locally
+and sets:
+- `ScanIndexForward = False`
 
-The Pico already produces them and AWS already accepts them.
+So history is returned newest first.
 
-The missing link is the local parser/schema/storage layer.
-
-## 17.4 Formalize systemd units
-
-The current design suggests at least two supervised services:
-
-- ingest listener service
-- queue worker service
-
-## 17.5 Make DB path and API config fully environment-driven
-
-That would bring the implementation back into line with the design spec.
+### Why the `~` suffix matters
+Because sort keys are strings, appending `~` on the upper bound ensures all keys beginning with `OBS#<to>` compare below the end key. It is a common lexicographic range-query trick.
 
 ---
 
-# 18. Bottom line
+## 12. End-to-end schema alignment
 
-The MVP is structurally sound.
+## 12.1 What lines up well
+There are several strong alignments in the MVP:
 
-It already has the key production-minded patterns in place:
+- The home worker produces a payload shape that the AWS ingest Lambda accepts.
+- The worker normalizes timestamps to `Z`, which the ingest Lambda requires.
+- The local queue model and the cloud dedupe model together provide at-least-once delivery.
+- Raw payloads are preserved both locally and in DynamoDB.
 
-- edge persistence
-- decoupled delivery queue
-- retry with backoff
-- cloud-side dedupe
-- a latest-item pattern for fast reads
-- raw-payload retention for debugging
+## 12.2 Where the current MVP is narrower than the intended design
 
-The biggest current documentation/code gap is the missing `storage.py` file. Other than that, the architecture is coherent:
+### Local home schema is narrower than the Pico payload
+The Pico emits rich weather fields, but the parser/storage/schema only preserve the basic weather core.
 
-- **Pico produces weather JSON**
-- **Pi listener validates and stores it in SQLite**
-- **queue worker drains SQLite to AWS**
-- **AWS writes history + latest + dedupe items into DynamoDB**
-- **read Lambda serves latest and history to downstream clients**
+### Local dedupe key and cloud dedupe key differ
+Local dedupe uses:
+- `source_node_id + source_ts_utc`
 
+Cloud dedupe uses:
+- `source_node_id + msg_id`
+
+### `derived_state` exists in schema but is not implemented
+The design docs talk about health/offline/degraded logic, but the current code does not compute it.
+
+### Read endpoints are open
+The write API is protected by the shared secret, but the read API is not authenticated in the current Lambda implementation.
+
+---
+
+## 13. Practical interpretation of each database in the MVP
+
+## 13.1 SQLite on the Raspberry Pi
+This is the **operational durability layer**.
+
+It answers:
+- What weather did we successfully ingest locally?
+- What health packets did we see?
+- What weird/bad packets did we reject?
+- What still needs to be sent to AWS?
+- What delivery errors happened?
+
+It is the place you would inspect first during debugging.
+
+## 13.2 DynamoDB in AWS
+This is the **cloud serving and dedupe layer**.
+
+It answers:
+- What is the latest reading for station X?
+- What is the history for station X over a time window?
+- Has message id Y for station X already been accepted?
+
+It is optimized for:
+- cheap serverless operation,
+- fast latest reads,
+- easy history queries,
+- idempotent ingest.
+
+---
+
+## 14. Final summary
+
+The current MVP is solidly structured around a durable local queue and a simple serverless cloud backend.
+
+### Locally on the Pi
+- `listen_meshtastic.py` ingests packets.
+- `parser.py` classifies them.
+- `storage.py` saves them to SQLite.
+- `weather_readings` stores accepted weather.
+- `aws_delivery_queue` persists delivery state.
+- `device_health_events` stores health history.
+- `device_status_current` stores latest known per-device values.
+- `ingest_events` stores rejected/unknown/duplicate traffic.
+- `queue_worker.py` drains the queue to AWS.
+
+### In AWS
+- API Gateway exposes three routes.
+- The ingest Lambda validates and writes observations.
+- DynamoDB stores observation history, latest snapshots, and dedupe items.
+- The read Lambda serves latest and history queries.
+
+### The most important implementation realities right now
+- local weather storage requires `source_ts_utc`,
+- local dedupe is based on `source_ts_utc`,
+- cloud dedupe is based on `msg_id`,
+- the local schema currently stores only the core weather fields,
+- `derived_state` is planned in schema but not yet implemented.
+
+Those are the key facts to understand if you are going to extend this MVP into the next version.
