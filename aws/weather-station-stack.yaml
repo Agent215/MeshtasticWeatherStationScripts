@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Weather Station backend - HTTP API + Lambda + DynamoDB
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: weather-station
+
+  EnvironmentName:
+    Type: String
+    Default: dev
+
+  ApiSharedSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Shared secret expected in x-weatherstation-key header
+
+  TableName:
+    Type: String
+    Default: WeatherObservations
+
+  AllowedCorsOrigin:
+    Type: String
+    Default: "*"
+
+Resources:
+  WeatherObservationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  WeatherLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvironmentName}-weather-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-${EnvironmentName}-weather-lambda-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !GetAtt WeatherObservationsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  IngestObservationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvironmentName}-ingest-observation"
+      Runtime: python3.13
+      Handler: app.handler
+      Role: !GetAtt WeatherLambdaRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref WeatherObservationsTable
+          API_SHARED_SECRET: !Ref ApiSharedSecret
+          ALLOWED_CORS_ORIGIN: !Ref AllowedCorsOrigin
+      Code: ingest/
+
+  ReadObservationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvironmentName}-read-observation"
+      Runtime: python3.13
+      Handler: app.handler
+      Role: !GetAtt WeatherLambdaRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref WeatherObservationsTable
+          ALLOWED_CORS_ORIGIN: !Ref AllowedCorsOrigin
+      Code: read/
+
+  WeatherHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentName}-http-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedCorsOrigin
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+          - x-weatherstation-key
+
+  IngestIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WeatherHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt IngestObservationFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  ReadIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WeatherHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ReadObservationFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  PostObservationsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WeatherHttpApi
+      RouteKey: "POST /observations"
+      Target: !Sub "integrations/${IngestIntegration}"
+
+  GetLatestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WeatherHttpApi
+      RouteKey: "GET /observations/latest"
+      Target: !Sub "integrations/${ReadIntegration}"
+
+  GetHistoryRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WeatherHttpApi
+      RouteKey: "GET /observations"
+      Target: !Sub "integrations/${ReadIntegration}"
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WeatherHttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  LambdaInvokePermissionForIngest:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestObservationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WeatherHttpApi}/*/*"
+
+  LambdaInvokePermissionForRead:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReadObservationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WeatherHttpApi}/*/*"
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL for the Weather HTTP API
+    Value: !GetAtt WeatherHttpApi.ApiEndpoint
+
+  TableNameOutput:
+    Description: DynamoDB table name
+    Value: !Ref WeatherObservationsTable
+
+  IngestFunctionNameOutput:
+    Description: Ingest Lambda function name
+    Value: !Ref IngestObservationFunction
+
+  ReadFunctionNameOutput:
+    Description: Read Lambda function name
+    Value: !Ref ReadObservationFunction
