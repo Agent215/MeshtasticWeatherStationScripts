@@ -94,7 +94,7 @@ Resources:
             Ref: AllowedCorsOrigin
       Code:
         S3Bucket: brahm-weather-station-cfn-artifacts-2026
-        S3Key: 87a77343b28789c177c2b02c06b0236c
+        S3Key: 97a1981e5ce997baef6c8a183e411ada
   ReadObservationFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -118,7 +118,7 @@ Resources:
             Ref: AllowedCorsOrigin
       Code:
         S3Bucket: brahm-weather-station-cfn-artifacts-2026
-        S3Key: ed3984a66ae6b138566d7ed283791e14
+        S3Key: 1f4ded92f0e12e4b1493437f0dcee00b
   WeatherHttpApi:
     Type: AWS::ApiGatewayV2::Api
     Properties:

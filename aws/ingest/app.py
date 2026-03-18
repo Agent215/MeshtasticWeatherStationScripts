@@ -16,9 +16,7 @@ TABLE_NAME = os.environ["TABLE_NAME"]
 API_SHARED_SECRET = os.environ["API_SHARED_SECRET"]
 ALLOWED_CORS_ORIGIN = os.environ.get("ALLOWED_CORS_ORIGIN", "*")
 
-ISO_UTC_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
-)
+NUMERIC_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 
 WEATHER_RULES = {
     "wind_lull_ms": {"min": Decimal("0"), "max": Decimal("150")},
@@ -44,6 +42,7 @@ WEATHER_RULES = {
     "precipitation_analysis_type": {"allowed": [0, 1, 2, 3, 4]},
 }
 
+
 def json_safe(value):
     if isinstance(value, list):
         return [json_safe(v) for v in value]
@@ -54,6 +53,7 @@ def json_safe(value):
             return int(value)
         return float(value)
     return value
+
 
 def response(status, body):
     return {
@@ -67,8 +67,14 @@ def response(status, body):
         "body": json.dumps(json_safe(body)),
     }
 
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def get_headers(event):
     return event.get("headers") or {}
+
 
 def parse_body(event):
     body = event.get("body")
@@ -78,27 +84,79 @@ def parse_body(event):
         body = base64.b64decode(body).decode("utf-8")
     return json.loads(body, parse_float=Decimal)
 
+
 def auth_ok(event):
     headers = get_headers(event)
     provided = headers.get("x-weatherstation-key") or headers.get("X-Weatherstation-Key")
     return provided == API_SHARED_SECRET
 
-def pad_msg_id(msg_id):
-    return str(int(msg_id)).zfill(10)
 
-def is_valid_iso_utc(ts):
-    if not isinstance(ts, str):
-        return False
-    if not ISO_UTC_RE.match(ts):
-        return False
-    try:
-        datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return True
-    except ValueError:
-        return False
+def normalize_epoch_seconds(value: Decimal) -> Decimal:
+    magnitude = abs(value)
+
+    if magnitude >= Decimal("100000000000000"):  # microseconds
+        return value / Decimal("1000000")
+
+    if magnitude >= Decimal("100000000000"):  # milliseconds
+        return value / Decimal("1000")
+
+    return value  # seconds
+
+
+def format_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def normalize_timestamp_to_sortable_utc(value, field_name: str) -> str:
+    if value is None:
+        raise ValueError(f"{field_name} is required")
+
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an ISO-8601 UTC string or epoch number")
+
+    if isinstance(value, (int, Decimal)):
+        numeric_value = normalize_epoch_seconds(Decimal(str(value)))
+        if numeric_value < 0:
+            raise ValueError(f"{field_name} epoch must be non-negative")
+        try:
+            dt = datetime.fromtimestamp(float(numeric_value), tz=timezone.utc)
+        except Exception:
+            raise ValueError(f"{field_name} epoch is out of range")
+        return format_utc(dt)
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise ValueError(f"{field_name} must not be empty")
+
+        if NUMERIC_RE.match(raw):
+            numeric_value = normalize_epoch_seconds(Decimal(raw))
+            if numeric_value < 0:
+                raise ValueError(f"{field_name} epoch must be non-negative")
+            try:
+                dt = datetime.fromtimestamp(float(numeric_value), tz=timezone.utc)
+            except Exception:
+                raise ValueError(f"{field_name} epoch is out of range")
+            return format_utc(dt)
+
+        iso_candidate = raw.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(iso_candidate)
+        except ValueError:
+            raise ValueError(
+                f"{field_name} must be an ISO-8601 UTC string like 2026-03-18T00:45:46.982324Z "
+                f"or an epoch number"
+            )
+
+        if dt.tzinfo is None:
+            raise ValueError(f"{field_name} must include timezone information")
+        return format_utc(dt)
+
+    raise ValueError(f"{field_name} must be an ISO-8601 UTC string or epoch number")
+
 
 def validate_number_field(name, value):
-    if not isinstance(value, (int, Decimal)):
+    if isinstance(value, bool) or not isinstance(value, (int, Decimal)):
         return f"{name} must be numeric"
 
     rules = WEATHER_RULES.get(name)
@@ -121,6 +179,7 @@ def validate_number_field(name, value):
 
     return None
 
+
 def validate_weather(weather):
     if not isinstance(weather, dict):
         return ["payload.weather must be an object"]
@@ -129,14 +188,10 @@ def validate_weather(weather):
 
     for key, value in weather.items():
         if key == "timestamp":
-            if isinstance(value, str):
-                if not is_valid_iso_utc(value):
-                    errors.append("weather.timestamp must be ISO-8601 UTC like 2026-03-18T00:45:46.982324Z")
-            elif isinstance(value, (int, Decimal)):
-                if Decimal(str(value)) < 0:
-                    errors.append("weather.timestamp epoch must be non-negative")
-            else:
-                errors.append("weather.timestamp must be ISO-8601 UTC string or epoch number")
+            try:
+                normalize_timestamp_to_sortable_utc(value, "weather.timestamp")
+            except ValueError as e:
+                errors.append(str(e))
             continue
 
         if key in WEATHER_RULES:
@@ -145,6 +200,11 @@ def validate_weather(weather):
                 errors.append(err)
 
     return errors
+
+
+def serialize_item(item: dict) -> dict:
+    return {k: serializer.serialize(v) for k, v in item.items()}
+
 
 def handler(event, context):
     method = (((event.get("requestContext") or {}).get("http") or {}).get("method") or "").upper()
@@ -168,12 +228,12 @@ def handler(event, context):
     if not isinstance(payload, dict):
         return response(400, {"ok": False, "error": "payload_must_be_object"})
 
-    weather = payload.get("weather") or {}
+    weather = payload.get("weather")
     source_node_id = payload.get("source_node_id")
     msg_id = payload.get("msg_id")
     received_at_utc = payload.get("received_at_utc")
     source_name = payload.get("source_name")
-    source_ts_utc = payload.get("source_ts_utc")
+    source_ts_raw = payload.get("source_ts_utc")
 
     errors = []
 
@@ -184,26 +244,33 @@ def handler(event, context):
         errors.append("payload.msg_id is required")
     else:
         try:
-            int(msg_id)
+            msg_id = int(msg_id)
         except Exception:
             errors.append("payload.msg_id must be an integer")
 
-    if not received_at_utc:
-        errors.append("payload.received_at_utc is required")
-    elif not is_valid_iso_utc(received_at_utc):
-        errors.append("payload.received_at_utc must be ISO-8601 UTC like 2026-03-18T00:45:46.982324Z")
+    if weather is None:
+        errors.append("payload.weather is required")
+        weather = {}
+    elif not isinstance(weather, dict):
+        errors.append("payload.weather must be an object")
 
-    if source_ts_utc is not None:
-        if isinstance(source_ts_utc, str):
-            if source_ts_utc.isdigit():
-                pass
-            elif not is_valid_iso_utc(source_ts_utc):
-                errors.append("payload.source_ts_utc must be epoch string or ISO-8601 UTC string")
-        elif isinstance(source_ts_utc, (int, Decimal)):
-            if Decimal(str(source_ts_utc)) < 0:
-                errors.append("payload.source_ts_utc epoch must be non-negative")
-        else:
-            errors.append("payload.source_ts_utc must be string or number")
+    try:
+        received_at_sort_utc = normalize_timestamp_to_sortable_utc(
+            received_at_utc,
+            "payload.received_at_utc",
+        )
+    except ValueError as e:
+        errors.append(str(e))
+        received_at_sort_utc = None
+
+    try:
+        source_ts_sort_utc = normalize_timestamp_to_sortable_utc(
+            source_ts_raw,
+            "payload.source_ts_utc",
+        )
+    except ValueError as e:
+        errors.append(str(e))
+        source_ts_sort_utc = None
 
     errors.extend(validate_weather(weather))
 
@@ -211,92 +278,89 @@ def handler(event, context):
         return response(400, {"ok": False, "error": "validation_failed", "details": errors})
 
     pk = "STATION#" + str(source_node_id)
-    padded_msg_id = pad_msg_id(msg_id)
-    obs_sk = "OBS#" + str(received_at_utc) + "#" + padded_msg_id
+    obs_sk = f"OBS#{source_ts_sort_utc}#WEATHER"
     latest_sk = "LATEST"
-    dedupe_sk = "DEDUPE#" + padded_msg_id
+    ingested_at_utc = utc_now_iso()
 
     observation_item = {
         "pk": pk,
         "sk": obs_sk,
         "record_type": "observation",
+        "observation_type": "WEATHER",
         "source_node_id": source_node_id,
         "source_name": source_name,
-        "msg_id": int(msg_id),
-        "source_ts_utc": source_ts_utc,
-        "received_at_utc": received_at_utc,
+        "msg_id": msg_id,
+        "source_ts_utc": source_ts_sort_utc,
+        "source_ts_raw": source_ts_raw,
+        "source_ts_sort_utc": source_ts_sort_utc,
+        "received_at_utc": received_at_sort_utc,
         "weather": weather,
         "raw_payload": req,
-        "ingested_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ingested_at_utc": ingested_at_utc,
     }
 
     latest_item = {
         "pk": pk,
         "sk": latest_sk,
         "record_type": "latest",
+        "observation_type": "WEATHER",
         "source_node_id": source_node_id,
         "source_name": source_name,
-        "msg_id": int(msg_id),
-        "source_ts_utc": source_ts_utc,
-        "received_at_utc": received_at_utc,
+        "msg_id": msg_id,
+        "source_ts_utc": source_ts_sort_utc,
+        "source_ts_raw": source_ts_raw,
+        "source_ts_sort_utc": source_ts_sort_utc,
+        "received_at_utc": received_at_sort_utc,
         "weather": weather,
         "latest_observation_sk": obs_sk,
-        "updated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-
-    dedupe_item = {
-        "pk": pk,
-        "sk": dedupe_sk,
-        "record_type": "dedupe",
-        "source_node_id": source_node_id,
-        "msg_id": int(msg_id),
-        "received_at_utc": received_at_utc,
+        "updated_at_utc": utc_now_iso(),
     }
 
     try:
-        ddb.transact_write_items(
-            TransactItems=[
-                {
-                    "Put": {
-                        "TableName": TABLE_NAME,
-                        "Item": {k: serializer.serialize(v) for k, v in dedupe_item.items()},
-                        "ConditionExpression": "attribute_not_exists(pk) AND attribute_not_exists(sk)",
-                    }
-                },
-                {
-                    "Put": {
-                        "TableName": TABLE_NAME,
-                        "Item": {k: serializer.serialize(v) for k, v in observation_item.items()},
-                    }
-                },
-                {
-                    "Put": {
-                        "TableName": TABLE_NAME,
-                        "Item": {k: serializer.serialize(v) for k, v in latest_item.items()},
-                    }
-                },
-            ]
-        )
-        return response(
-            200,
-            {
-                "ok": True,
-                "deduped": False,
-                "source_node_id": source_node_id,
-                "msg_id": int(msg_id),
-                "observation_sk": obs_sk,
-            },
+        ddb.put_item(
+            TableName=TABLE_NAME,
+            Item=serialize_item(observation_item),
+            ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)",
         )
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
-        if code == "TransactionCanceledException":
+        if code == "ConditionalCheckFailedException":
             return response(
                 200,
                 {
                     "ok": True,
                     "deduped": True,
                     "source_node_id": source_node_id,
-                    "msg_id": int(msg_id),
+                    "msg_id": msg_id,
+                    "source_ts_utc": source_ts_sort_utc,
+                    "observation_sk": obs_sk,
                 },
             )
         raise
+
+    try:
+        ddb.put_item(
+            TableName=TABLE_NAME,
+            Item=serialize_item(latest_item),
+            ConditionExpression="attribute_not_exists(pk) OR source_ts_sort_utc <= :incoming_ts",
+            ExpressionAttributeValues={
+                ":incoming_ts": serializer.serialize(source_ts_sort_utc),
+            },
+        )
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code != "ConditionalCheckFailedException":
+            raise
+        # Older out-of-order observation. Keep history row, but do not move LATEST backwards.
+
+    return response(
+        200,
+        {
+            "ok": True,
+            "deduped": False,
+            "source_node_id": source_node_id,
+            "msg_id": msg_id,
+            "source_ts_utc": source_ts_sort_utc,
+            "observation_sk": obs_sk,
+        },
+    )
