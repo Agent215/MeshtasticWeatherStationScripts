@@ -31,7 +31,7 @@ The design goal is reliability first:
 
 ```text
 Tempest / upstream weather source
-  -> garden-side controller (`main.py`)
+  -> garden-side controller (`gardenNode/main.py`)
   -> Meshtastic text message
   -> home Meshtastic node over USB serial
   -> `listen_meshtastic.py`
@@ -82,10 +82,14 @@ That identity is used in both places:
 
 # 2. Codebase map
 
+This document describes the current production architecture. Not every production home-server module described below is currently checked into this repository.
+
 ## 2.1 Home-side files
 
 ### `listen_meshtastic.py`
 Long-running listener process on the Raspberry Pi. It connects to the home Meshtastic node over USB serial, receives packets, and routes them into storage.
+
+In this repository, the checked-in Meshtastic-side utility is `home_server_listen_meshtastic.py`. The fuller production listener/storage pipeline described here is not fully present in the repo yet.
 
 ### `parser.py`
 Parses the decoded text payload from Meshtastic and classifies it as:
@@ -110,24 +114,24 @@ Polls pending rows from the local delivery queue and POSTs them to AWS.
 
 ## 2.2 Garden-side producer files
 
-### `main.py`
+### `gardenNode/main.py`
 Garden-side controller / bridge. It rate-limits outgoing weather messages, attaches `msg_id`, carries forward the source timestamp, and sends health/debug packets periodically.
 
-### `mock_tempest_udp_sender.py`
+### `mocks/mock_tempest_udp_sender.py`
 A local test generator for Tempest-style UDP packets.
 
 ## 2.3 AWS files
 
-### `weather-station-stack.yaml`
+### `aws/weather-station-stack.yaml`
 Source CloudFormation template.
 
-### `packaged-template.yaml`
+### `aws/packaged-template.yaml`
 Packaged CloudFormation template with Lambda code artifacts uploaded to S3.
 
-### `app.py`
+### `aws/ingest/app.py`
 AWS ingest Lambda.
 
-### `appRead.py`
+### `aws/read/app.py`
 AWS read Lambda.
 
 ---
@@ -945,7 +949,7 @@ queue_worker fetches pending row
 
 Although the home server is the main focus of this document, two garden-side behaviors are important for understanding the data model.
 
-## 7.1 `main.py` rate-limits weather forwarding
+## 7.1 `gardenNode/main.py` rate-limits weather forwarding
 
 The controller defines:
 

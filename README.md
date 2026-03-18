@@ -1,173 +1,104 @@
 # Weather Station Scripts
 
-This repository contains the garden-side bridge code for a self-hosted weather station and the current design documents for the full end-to-end system.
+This repository contains the current weather-station MVP documentation plus the code artifacts that support the garden bridge, Meshtastic ingest, AWS APIs, and local test tooling.
 
-The implemented code today focuses on the Raspberry Pi Pico W in the garden:
+The production system is a store-and-forward pipeline:
 
-- Listen for local WeatherFlow Tempest UDP broadcasts on the garden LAN
-- Extract the key `obs_st` weather fields and preserve the Tempest observation timestamp
-- Validate and compact the payload while rate-limiting outbound weather messages
-- Forward the result over UART to a Meshtastic/RAK node
-- Emit heartbeat/status messages and recover from stalled/no-weather conditions
+`weather source -> garden bridge -> Meshtastic -> home Raspberry Pi -> SQLite backlog -> AWS ingest API -> DynamoDB -> read APIs`
 
-The broader system described in the documentation extends that path to a home Meshtastic node, a Raspberry Pi gateway, local SQLite storage, and AWS delivery.
+The primary production reference is [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md). That document describes the current home-server schema, queueing model, AWS stack, and DynamoDB data model. The checked-in code in this repository covers the garden bridge, a Meshtastic listener utility, the AWS Lambda handlers, and mocks used for bench testing.
 
-## Table of Contents
+## Production Overview
 
-- [System Overview](#system-overview)
-- [Repository Contents](#repository-contents)
-- [Implemented Script Behavior](#implemented-script-behavior)
-  - [`main.py`](#mainpy)
-  - [`mock_tempest_sender.py`](#mock_tempest_senderpy)
-- [Hardware and Interface Notes](#hardware-and-interface-notes)
-- [Setup](#setup)
-  - [Pico W bridge](#pico-w-bridge)
-  - [Mock testing](#mock-testing)
-- [Documentation Summary](#documentation-summary)
-  - [Overall system design](#overall-system-design)
-  - [Planned home gateway](#planned-home-gateway)
-- [Current Project Status](#current-project-status)
-- [Notes](#notes)
-- [License](#license)
+- Garden-side weather data is received over local UDP and forwarded over UART into a Meshtastic node.
+- The home side is the durable ingest point in production: accepted packets are stored in SQLite, queued for AWS delivery, and retried until they succeed.
+- AWS stores historical observations and a latest snapshot in DynamoDB behind API Gateway and Lambda.
+- System-wide weather identity is timestamp-based: `(source_node_id, source_ts_utc)`.
 
-## System Overview
+## Repository Layout
 
-Planned message flow:
+- [`gardenNode/main.py`](./gardenNode/main.py): MicroPython garden bridge for the Raspberry Pi Pico W
+- [`home_server_listen_meshtastic.py`](./home_server_listen_meshtastic.py): home-side Meshtastic USB listener/logger utility
+- [`aws/ingest/app.py`](./aws/ingest/app.py): ingest Lambda for `POST /observations`
+- [`aws/read/app.py`](./aws/read/app.py): read Lambda for `GET /observations` and `GET /observations/latest`
+- [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml): source CloudFormation template
+- [`aws/packaged-template.yaml`](./aws/packaged-template.yaml): packaged CloudFormation template
+- [`mocks/mock_tempest_udp_sender.py`](./mocks/mock_tempest_udp_sender.py): mock Tempest `obs_st` UDP sender
+- [`mocks/ecowitt_mock_server_v3.py`](./mocks/ecowitt_mock_server_v3.py): mock Ecowitt LAN API server for local integration work
+- [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md): current production architecture and schema
+- [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md): broader system design background
+- [`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md): earlier home-server design document
 
-`Tempest sensor -> Tempest hub -> garden Wi-Fi LAN -> Pico W -> UART -> garden RAK node -> Meshtastic mesh -> home RAK node -> Raspberry Pi -> SQLite -> AWS`
+## Garden Bridge
 
-Current code in this repo implements the `garden Wi-Fi LAN -> Pico W -> UART` portion and includes a mock UDP sender for bench testing.
-
-## Repository Contents
-
-- [`main.py`](./main.py): MicroPython application for the Raspberry Pi Pico W
-- [`mock_tempest_sender.py`](./mock_tempest_sender.py): desktop test utility that sends Tempest-style `obs_st` UDP packets
-- [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md): overall system architecture, hardware, interfaces, power, bring-up plan, and AWS overview
-- [`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md): planned Raspberry Pi home gateway design, packet handling, SQLite schema, retry behavior, and deployment notes
-
-## Implemented Script Behavior
-
-### `main.py`
-
-`main.py` is intended to run on a Raspberry Pi Pico W under MicroPython.
+[`gardenNode/main.py`](./gardenNode/main.py) runs on a Raspberry Pi Pico W under MicroPython and currently implements the garden-side production bridge.
 
 It does the following:
 
-- Connects the Pico W to the local garden Wi-Fi network
-- Binds a UDP listener on port `50222`
-- Accepts Tempest `obs_st` packets and ignores other packet types
-- Extracts these fields from the first observation record:
-  - timestamp
-  - temperature
-  - humidity
-  - pressure
-  - average wind speed
-  - wind direction
-  - rain accumulation for the interval
-- Rejects malformed or out-of-range readings
-- Limits forwarding to one weather message per 60 seconds
-- Includes the Tempest source timestamp in each forwarded weather payload
-- Sends compact newline-delimited JSON over UART at `115200` baud
-- Sends a heartbeat/status JSON message every 6 hours with uptime, IP, and no-weather counter data
-- Enables the RP2040 watchdog after Wi-Fi and UDP startup completes
-- Uses staged recovery if the main loop stays healthy but no weather is forwarded:
-  - recreate the UDP socket after 60 no-weather cycles
-  - force a Wi-Fi reconnect after 120 no-weather cycles
-  - reboot the Pico after 180 no-weather cycles
-- Recreates the UDP listener after Wi-Fi reconnects and after recoverable socket/main-loop errors
+- connects to local Wi-Fi and listens for Tempest-style `obs_st` UDP packets on port `50222`
+- validates and rounds the incoming observation fields before forwarding
+- forwards compact newline-delimited JSON over UART at `115200` baud
+- uses `GP0` for TX and `GP1` for RX
+- rate-limits weather forwarding to one message every 60 seconds
+- emits a `sys="dbg"` heartbeat every 15 minutes
+- performs staged recovery when UDP traffic stops arriving:
+  - recreate the UDP socket after 120 no-UDP cycles
+  - force a Wi-Fi reconnect after 300 no-UDP cycles
+  - reboot is effectively disabled in the current build (`NO_UDP_REBOOT_THRESHOLD = 999999`)
 
-Weather payload sent over UART:
+Current weather payload shape:
 
 ```json
-{"i":17,"ts":1741985112,"t":22.5,"h":52,"p":1011.4,"w":3.4,"d":230,"r":0.0}
+{"i":17,"ts":1741985112,"t":22.5,"h":52,"p":1011.4,"w":3.4,"g":5.2,"l":1.1,"d":230,"r":0.0,"uv":2.4,"sr":410.0,"lux":12500,"bat":2.48,"ld":0.0,"lc":0,"pt":0,"ri":1,"rd":0.0,"nr":0.0,"nrd":0.0,"pa":0}
 ```
 
-Heartbeat payload sent over UART:
+Current heartbeat payload shape:
 
 ```json
-{"sys":"ok","i":18,"up":21600,"ip":"192.168.1.205","nw":14}
+{"sys":"dbg","i":18,"up":900,"ip":"192.168.1.205","wc":1,"pm":0,"udp":54,"jerr":0,"nobs":0,"rej":0,"skip":44,"sockrec":0,"wifirec":0,"sockerr":0,"nwu":0,"last_udp_s":2,"last_obs_s":2,"last_ok_s":61}
 ```
 
-### `mock_tempest_sender.py`
+## Home Side And AWS
 
-This script is a host-side test tool for bench work and LAN validation.
+[`home_server_listen_meshtastic.py`](./home_server_listen_meshtastic.py) is the checked-in home-side listener utility. It connects to a Meshtastic node over USB serial, logs packet metadata and decoded text payloads, and automatically reconnects if the serial link drops. It uses the `MESHTASTIC_DEVICE` environment variable to target a specific serial device.
 
-It does the following:
+The current production home-server architecture is documented in [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md). That document defines the SQLite-backed ingest pipeline, including the production `parser.py`, `storage.py`, `db.py`, `schema.sql`, and `queue_worker.py` modules. Those home-server modules are described in the architecture doc but are not currently checked into this repository.
 
-- Generates realistic-looking Tempest `obs_st` UDP payloads
-- Sends them to a target IP and port at a configurable interval
-- Defaults to UDP broadcast on `255.255.255.255:50222`
-- Can also send directly to the Pico W IP for unicast testing
+The AWS side in this repository matches the production design:
 
-Example:
+- [`aws/ingest/app.py`](./aws/ingest/app.py) accepts `POST /observations`, requires the `x-weatherstation-key` header, normalizes timestamps, validates the `weather` object, and writes DynamoDB observation items idempotently.
+- [`aws/read/app.py`](./aws/read/app.py) serves `GET /observations/latest?stationId=...` and `GET /observations?stationId=...&from=...&to=...`.
+- [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml) provisions API Gateway HTTP API, the ingest/read Lambdas, IAM permissions, and the DynamoDB table.
 
-```powershell
-python mock_tempest_sender.py --target 192.168.1.205 --interval 10
-```
+## Data Model
 
-Or broadcast on the local LAN:
+The production data model uses two databases with different roles:
 
-```powershell
-python mock_tempest_sender.py
-```
+- SQLite on the home server is the operational store for accepted weather packets, health/debug history, ingest diagnostics, and the persistent AWS delivery queue.
+- DynamoDB is the cloud serving store for weather history and the latest observation snapshot.
 
-## Hardware and Interface Notes
+The architecture document defines these SQLite tables:
 
-Based on the code and design docs, the important garden-side assumptions are:
+- `weather_readings`
+- `aws_delivery_queue`
+- `device_health_events`
+- `device_status_current`
+- `ingest_events`
 
-- The Tempest hub and Pico W must be on the same local Wi-Fi network
-- Tempest data is consumed from local UDP broadcast on port `50222`
-- Pico W UART uses:
-  - `GP0` as TX
-  - `GP1` as RX
-  - `115200` baud
-- Garden Meshtastic node serial settings should be:
+The DynamoDB table uses a single-table key design:
 
-```text
-Serial enabled: ON
-Echo enabled: ON
-RX: 15
-TX: 16
-Serial baud rate: 115200
-Timeout: 0
-Serial mode: TEXTMSG
-Override console serial port: OFF
-```
-
-- Pico W to RAK4630 wiring should be:
-
-```text
-Pico GP0 (TX) -> RAK RX1
-Pico GP1 (RX) -> RAK TX1
-Pico GND      -> RAK GND
-```
-
-- UART wiring to the RAK/Meshtastic node should use 3.3 V logic and shared ground
-- Do not feed 5 V UART logic into the RAK UART pins
+- partition key: `pk = STATION#<source_node_id>`
+- historical observation key: `sk = OBS#<normalized_source_ts_utc>#WEATHER`
+- latest snapshot key: `sk = LATEST`
 
 ## Setup
 
-### Pico W bridge
+### Garden bridge
 
-1. Install MicroPython on the Raspberry Pi Pico W.
-2. Edit [`main.py`](./main.py) and set:
-   - `WIFI_SSID`
-   - `WIFI_PASSWORD`
-3. Copy `main.py` to the Pico as the boot script.
-4. Configure the garden Meshtastic node serial settings:
-
-```text
-Serial enabled: ON
-Echo enabled: ON
-RX: 15
-TX: 16
-Serial baud rate: 115200
-Timeout: 0
-Serial mode: TEXTMSG
-Override console serial port: OFF
-```
-
-5. Wire the Pico to the RAK4630:
+1. Edit [`gardenNode/main.py`](./gardenNode/main.py) and set `WIFI_SSID` and `WIFI_PASSWORD`.
+2. Copy the script to the Pico W as `main.py`.
+3. Configure the garden Meshtastic node serial port for text messages at `115200` baud.
+4. Wire the Pico W to the Meshtastic node with shared ground and 3.3 V UART levels:
 
 ```text
 Pico GP0 (TX) -> RAK RX1
@@ -175,61 +106,53 @@ Pico GP1 (RX) -> RAK TX1
 Pico GND      -> RAK GND
 ```
 
-6. Power the Pico and confirm it joins Wi-Fi and starts listening on UDP port `50222`.
+5. Power the Pico and confirm it joins Wi-Fi and starts listening on UDP port `50222`.
 
 ### Mock testing
 
-1. Put the Pico W on the same LAN as the machine running the mock sender.
-2. Start the Pico bridge.
-3. Run [`mock_tempest_sender.py`](./mock_tempest_sender.py) from a desktop Python environment.
-4. Confirm the Pico logs parsed `obs_st` packets and forwards compact JSON over UART.
+Send Tempest-style UDP packets to the Pico:
 
-## Documentation Summary
+```powershell
+python .\mocks\mock_tempest_udp_sender.py --target 192.168.1.205 --interval 10
+```
 
-### Overall system design
+Or broadcast on the LAN:
 
-[`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md) defines the recommended full architecture:
+```powershell
+python .\mocks\mock_tempest_udp_sender.py
+```
 
-- Tempest sensor and hub in the garden
-- Private garden Wi-Fi LAN
-- Pico W as the local UDP-to-UART bridge
-- Garden and home Meshtastic nodes using US915 LoRa
-- Raspberry Pi home gateway over USB
-- AWS backend using API Gateway, Lambda, and DynamoDB
-- 12 V solar/battery power with a regulated 5 V rail for garden electronics
+### Home listener utility
 
-### Planned home gateway
+1. Install the Python dependencies used by [`home_server_listen_meshtastic.py`](./home_server_listen_meshtastic.py), including `meshtastic` and `pypubsub`.
+2. Set `MESHTASTIC_DEVICE` if you want to target a specific serial path.
+3. Run:
 
-[`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md) describes the not-yet-implemented home-side service:
+```powershell
+python .\home_server_listen_meshtastic.py
+```
 
-- USB serial ingest from the home Meshtastic node
-- Packet classification into weather vs. health/status
-- SQLite as the local system of record
-- Durable AWS retry queue
-- Derived node state such as `healthy`, `degraded`, `offline`, and `bad_health`
-- `systemd` deployment on a Raspberry Pi 5
+### AWS stack
 
-## Current Project Status
+Deploy [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml) or [`aws/packaged-template.yaml`](./aws/packaged-template.yaml) with values for:
 
-Implemented in this repo:
+- `ProjectName`
+- `EnvironmentName`
+- `ApiSharedSecret`
+- `TableName`
+- `AllowedCorsOrigin`
 
-- Pico W UDP listener and UART bridge
-- Compact outbound weather payloads with source timestamps
-- Heartbeat/status payloads from the Pico
-- Watchdog-backed staged recovery for no-weather and connectivity faults
-- Mock Tempest UDP sender for testing
+## Documentation
 
-Specified in docs but not implemented here yet:
+- [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md) is the current source of truth for the production home-server and AWS design.
+- [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md) captures the broader system and hardware plan.
+- [`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md) is useful background, but the MVP architecture document supersedes it for the current production schema and cloud flow.
 
-- Raspberry Pi home gateway service
-- SQLite storage and deduplication layer
-- AWS delivery worker and retry queue
-- Website or dashboard
+## Current Status
 
-## Notes
-
-- `main.py` is MicroPython code for the Pico W, not standard desktop Python.
-- `mock_tempest_sender.py` is standard Python intended to run on a laptop or desktop during testing.
+- The production architecture is documented for the full garden -> home server -> AWS path.
+- The repository currently includes the garden bridge, a home Meshtastic listener utility, AWS ingest/read Lambdas, infrastructure templates, and mocks.
+- Some production home-server modules described in the architecture document are not currently present in this repository.
 - There are currently no automated tests in this repository.
 
 ## License
