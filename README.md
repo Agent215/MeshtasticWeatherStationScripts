@@ -58,6 +58,59 @@ Current heartbeat payload shape:
 {"sys":"dbg","i":18,"up":900,"ip":"192.168.1.205","wc":1,"pm":0,"udp":54,"jerr":0,"nobs":0,"rej":0,"skip":44,"sockrec":0,"wifirec":0,"sockerr":0,"nwu":0,"last_udp_s":2,"last_obs_s":2,"last_ok_s":61}
 ```
 
+## Hardware And Interface Notes
+
+The current production-oriented hardware layout is:
+
+- WeatherFlow Tempest sensor and hub
+- a small garden 2.4 GHz router/LAN
+- Raspberry Pi Pico W in the garden
+- garden and home RAK Meshtastic nodes
+- a home Raspberry Pi connected to the home node by USB
+- a 12 V solar/battery system in the garden with a regulated 5 V rail
+
+Important garden-side assumptions:
+
+- the Tempest hub and Pico W must be on the same local Wi-Fi network
+- the Pico listens for local UDP broadcast traffic on port `50222`
+- internet access is not required for local UDP collection
+- the Pico forwards newline-delimited JSON over UART into the garden Meshtastic node
+
+Pico UART details from the current bridge code:
+
+- `GP0` = TX
+- `GP1` = RX
+- `115200` baud
+- 3.3 V logic only
+
+Recommended Meshtastic serial settings from the existing project notes:
+
+```text
+Serial enabled: ON
+Echo enabled: ON
+RX: 15
+TX: 16
+Serial baud rate: 115200
+Timeout: 0
+Serial mode: TEXTMSG
+Override console serial port: OFF
+```
+
+Recommended Pico-to-RAK wiring:
+
+```text
+Pico GP0 (TX) -> RAK RX1
+Pico GP1 (RX) -> RAK TX1
+Pico GND      -> RAK GND
+```
+
+Additional hardware notes that matter in practice:
+
+- do not feed 5 V UART logic into the RAK UART pins
+- connect the home Meshtastic node to the Raspberry Pi by USB for the most stable long-running gateway link
+- both Meshtastic radios should be configured for the same region and channel/PSK; the earlier design notes assume `US915`
+- the broader hardware and power plan, including antenna and solar/battery notes, is documented in [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md)
+
 ## Home Side And AWS
 
 [`home_server_listen_meshtastic.py`](./home_server_listen_meshtastic.py) is the checked-in home-side listener utility. It connects to a Meshtastic node over USB serial, logs packet metadata and decoded text payloads, and automatically reconnects if the serial link drops. It uses the `MESHTASTIC_DEVICE` environment variable to target a specific serial device.
