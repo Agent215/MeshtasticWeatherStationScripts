@@ -1,0 +1,10 @@
+{
+  "GET /observations/latest": {
+    "ThrottlingBurstLimit": 5,
+    "ThrottlingRateLimit": 1
+  },
+  "GET /observations": {
+    "ThrottlingBurstLimit": 2,
+    "ThrottlingRateLimit": 0.2
+  }
+}
