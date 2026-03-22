@@ -8,11 +8,17 @@ from machine import Pin, UART
 # ============================================================
 # Pico W Tempest UDP -> UART bridge
 #
-# Changes in this version:
-#   - Disable Wi-Fi power saving
-#   - Debug heartbeat every 15 minutes
-#   - Recovery based on NO UDP RECEIVED, not no forwarded weather
-#   - Extra recovery/debug counters in heartbeat
+# Supports:
+#   - obs_st
+#   - evt_precip
+#   - evt_strike
+#   - device_status
+#   - hub_status
+#
+# Behavior:
+#   - Per-event-type forwarding throttle
+#   - Small outbound queue so messages are staggered
+#   - Replace-latest behavior for status/weather snapshots
 # ============================================================
 
 # ----------------------------
@@ -32,9 +38,21 @@ UART_RX_PIN = 1   # GP1
 SOCKET_TIMEOUT_SEC = 1.0
 WIFI_CONNECT_TIMEOUT_SEC = 20
 WIFI_RETRY_DELAY_SEC = 3
-MIN_FORWARD_INTERVAL_SEC = 60
 MAX_CONSECUTIVE_WIFI_FAILURES = 10
 MAX_CONSECUTIVE_MAIN_LOOP_FAILURES = 10
+
+# Per-type forward throttles (configurable)
+FORWARD_INTERVAL_OBS_ST_SEC = 60
+FORWARD_INTERVAL_EVT_PRECIP_SEC = 60
+FORWARD_INTERVAL_EVT_STRIKE_SEC = 30
+FORWARD_INTERVAL_DEVICE_STATUS_SEC = 60
+FORWARD_INTERVAL_HUB_STATUS_SEC = 60
+
+# Global pacing between ANY two UART sends to reduce mesh congestion
+MIN_UART_SEND_GAP_SEC = 5
+
+# Outbound queue behavior
+MAX_OUTBOUND_QUEUE = 12
 
 # Startup / heartbeat
 STARTUP_DELAY_SEC = 3
@@ -44,7 +62,6 @@ HEARTBEAT_INTERVAL_SEC = 15 * 60   # every 15 minutes
 POST_RECOVERY_DELAY_MS = 250
 
 # No-UDP staged recovery thresholds
-# Because recvfrom() times out every ~1 second, these behave roughly like seconds.
 NO_UDP_SOCKET_RECOVERY_THRESHOLD = 120
 NO_UDP_WIFI_RECOVERY_THRESHOLD = 300
 NO_UDP_REBOOT_THRESHOLD = 999999   # effectively disabled for now
@@ -60,7 +77,7 @@ uart = UART(0, baudrate=UART_BAUD, tx=Pin(UART_TX_PIN), rx=Pin(UART_RX_PIN))
 # ----------------------------
 msg_id = 1
 
-last_forward_tick_ms = None
+last_uart_send_tick_ms = None
 last_heartbeat_tick_ms = None
 boot_tick_ms = time.ticks_ms()
 
@@ -76,9 +93,12 @@ wifi_recovery_triggered = False
 # ----------------------------
 udp_packet_count = 0
 json_error_count = 0
-non_obs_count = 0
+unsupported_type_count = 0
 sanity_reject_count = 0
 rate_limit_skip_count = 0
+queue_replace_count = 0
+queue_drop_count = 0
+forwarded_count = 0
 
 socket_recreate_count = 0
 wifi_reconnect_count = 0
@@ -87,6 +107,35 @@ socket_error_count = 0
 last_any_udp_tick_ms = None
 last_obs_st_tick_ms = None
 last_valid_weather_tick_ms = None
+
+# Track last successful FORWARD per supported kind
+last_forward_by_kind_ms = {}
+
+# Simple outbound queue
+# each item = {"kind": "...", "data": ..., "priority": int, "queued_ms": int}
+outbound_queue = []
+
+SUPPORTED_KINDS = (
+    "obs_st",
+    "evt_precip",
+    "evt_strike",
+    "device_status",
+    "hub_status",
+)
+
+REPLACE_LATEST_KINDS = (
+    "obs_st",
+    "device_status",
+    "hub_status",
+)
+
+KIND_PRIORITY = {
+    "evt_strike": 0,
+    "evt_precip": 1,
+    "obs_st": 2,
+    "device_status": 3,
+    "hub_status": 4,
+}
 
 
 # ----------------------------
@@ -151,10 +200,6 @@ def get_wifi_pm_value(wlan):
 
 
 def disable_wifi_power_save(wlan):
-    """
-    Prefer official PM_NONE constant when available.
-    Fall back to pm=0 if needed.
-    """
     try:
         if hasattr(network.WLAN, "PM_NONE"):
             wlan.config(pm=network.WLAN.PM_NONE)
@@ -302,13 +347,6 @@ def is_socket_timeout_error(exc):
 
 
 def maybe_trigger_no_udp_recovery(wlan, sock):
-    """
-    Staged recovery based on consecutive healthy loop cycles with NO UDP RECEIVED.
-
-    >= 120 -> recreate UDP socket
-    >= 300 -> reconnect Wi-Fi
-    >= very high threshold -> reboot (disabled for now)
-    """
     global socket_recovery_triggered, wifi_recovery_triggered, consecutive_no_udp_cycles
 
     if consecutive_no_udp_cycles >= NO_UDP_REBOOT_THRESHOLD:
@@ -349,7 +387,120 @@ def maybe_trigger_no_udp_recovery(wlan, sock):
 
 
 # ----------------------------
-# Weather parsing / validation
+# Throttle / queue helpers
+# ----------------------------
+def min_forward_interval_ms_for_kind(kind):
+    if kind == "obs_st":
+        return seconds_to_ms(FORWARD_INTERVAL_OBS_ST_SEC)
+    if kind == "evt_precip":
+        return seconds_to_ms(FORWARD_INTERVAL_EVT_PRECIP_SEC)
+    if kind == "evt_strike":
+        return seconds_to_ms(FORWARD_INTERVAL_EVT_STRIKE_SEC)
+    if kind == "device_status":
+        return seconds_to_ms(FORWARD_INTERVAL_DEVICE_STATUS_SEC)
+    if kind == "hub_status":
+        return seconds_to_ms(FORWARD_INTERVAL_HUB_STATUS_SEC)
+    return seconds_to_ms(60)
+
+
+def may_forward_kind_now(kind):
+    last_tick = last_forward_by_kind_ms.get(kind)
+    if last_tick is None:
+        return True
+
+    interval_ms = min_forward_interval_ms_for_kind(kind)
+    return time.ticks_diff(time.ticks_ms(), last_tick) >= interval_ms
+
+
+def may_uart_send_now():
+    global last_uart_send_tick_ms
+
+    if last_uart_send_tick_ms is None:
+        return True
+
+    min_gap_ms = seconds_to_ms(MIN_UART_SEND_GAP_SEC)
+    return time.ticks_diff(time.ticks_ms(), last_uart_send_tick_ms) >= min_gap_ms
+
+
+def commit_uart_send(kind=None):
+    global last_uart_send_tick_ms, last_valid_weather_tick_ms, forwarded_count
+
+    now_tick = time.ticks_ms()
+    last_uart_send_tick_ms = now_tick
+
+    if kind is not None:
+        last_forward_by_kind_ms[kind] = now_tick
+        forwarded_count += 1
+
+        if kind == "obs_st":
+            last_valid_weather_tick_ms = now_tick
+
+
+def enqueue_forward_item(kind, data):
+    global rate_limit_skip_count, queue_replace_count, queue_drop_count
+
+    if kind not in SUPPORTED_KINDS:
+        return False
+
+    if not may_forward_kind_now(kind):
+        rate_limit_skip_count += 1
+        return False
+
+    queued_ms = time.ticks_ms()
+    priority = KIND_PRIORITY.get(kind, 99)
+
+    if kind in REPLACE_LATEST_KINDS:
+        for item in outbound_queue:
+            if item["kind"] == kind:
+                item["data"] = data
+                item["queued_ms"] = queued_ms
+                queue_replace_count += 1
+                return True
+
+    if len(outbound_queue) >= MAX_OUTBOUND_QUEUE:
+        print("Outbound queue full. Dropping", kind)
+        queue_drop_count += 1
+        return False
+
+    new_item = {
+        "kind": kind,
+        "data": data,
+        "priority": priority,
+        "queued_ms": queued_ms,
+    }
+
+    insert_at = len(outbound_queue)
+    for idx in range(len(outbound_queue)):
+        if priority < outbound_queue[idx]["priority"]:
+            insert_at = idx
+            break
+
+    outbound_queue.insert(insert_at, new_item)
+    return True
+
+
+def maybe_send_next_queued():
+    if not outbound_queue:
+        return False
+
+    if not may_uart_send_now():
+        return False
+
+    item = outbound_queue.pop(0)
+
+    try:
+        send_forward_item(item["kind"], item["data"])
+    except Exception:
+        # Put it back and re-raise so caller recovery logic can run
+        outbound_queue.insert(0, item)
+        raise
+
+    commit_uart_send(item["kind"])
+    return True
+
+
+# ----------------------------
+# Weather / event parsing
 # ----------------------------
 def round_weather_fields(obs):
     return {
@@ -421,12 +572,58 @@ def weather_values_are_sane(w):
     return True
 
 
-def parse_obs_st(packet_obj):
-    global non_obs_count, sanity_reject_count, last_obs_st_tick_ms
+def device_status_values_are_sane(d):
+    if d["ts"] < 0:
+        return False
+    if d["up"] < 0:
+        return False
+    if not (0 <= d["v"] <= 5):
+        return False
+    if not (-150 <= d["r"] <= 20):
+        return False
+    if not (-150 <= d["hr"] <= 20):
+        return False
+    if not (0 <= d["dbg"] <= 1):
+        return False
+    if d["ss"] < 0:
+        return False
+    return True
 
-    if packet_obj.get("type") != "obs_st":
-        non_obs_count += 1
-        return None
+
+def hub_status_values_are_sane(h):
+    if h["ts"] < 0:
+        return False
+    if h["up"] < 0:
+        return False
+    if not (-150 <= h["r"] <= 20):
+        return False
+    if h["seq"] < 0:
+        return False
+    if not isinstance(h["fs"], list):
+        return False
+    if not isinstance(h["rs"], list):
+        return False
+    if not isinstance(h["ms"], list):
+        return False
+    return True
+
+
+def strike_values_are_sane(s):
+    if s["ts"] < 0:
+        return False
+    if not (0 <= s["ld"] <= 500):
+        return False
+    if not (0 <= s["se"] <= 1000000000):
+        return False
+    return True
+
+
+def precip_values_are_sane(p):
+    return p["ts"] >= 0
+
+
+def parse_obs_st(packet_obj):
+    global sanity_reject_count, last_obs_st_tick_ms
 
     last_obs_st_tick_ms = time.ticks_ms()
 
@@ -443,7 +640,7 @@ def parse_obs_st(packet_obj):
     try:
         w = round_weather_fields(obs)
         if not weather_values_are_sane(w):
-            print("Rejected out-of-range weather payload:", w)
+            print("Rejected out-of-range obs_st payload:", w)
             sanity_reject_count += 1
             return None
         return w
@@ -453,23 +650,127 @@ def parse_obs_st(packet_obj):
         return None
 
 
-def may_forward_now():
-    global last_forward_tick_ms
+def parse_evt_precip(packet_obj):
+    global sanity_reject_count
 
-    if last_forward_tick_ms is None:
-        return True
+    evt = packet_obj.get("evt")
+    if not isinstance(evt, list) or len(evt) < 1:
+        sanity_reject_count += 1
+        return None
 
-    min_interval_ms = seconds_to_ms(MIN_FORWARD_INTERVAL_SEC)
-    if time.ticks_diff(time.ticks_ms(), last_forward_tick_ms) < min_interval_ms:
-        return False
+    try:
+        p = {
+            "ts": int(evt[0]),
+        }
+        if not precip_values_are_sane(p):
+            print("Rejected out-of-range evt_precip payload:", p)
+            sanity_reject_count += 1
+            return None
+        return p
+    except Exception as e:
+        print("evt_precip field parse error:", e)
+        sanity_reject_count += 1
+        return None
 
-    return True
+
+def parse_evt_strike(packet_obj):
+    global sanity_reject_count
+
+    evt = packet_obj.get("evt")
+    if not isinstance(evt, list) or len(evt) < 3:
+        sanity_reject_count += 1
+        return None
+
+    try:
+        s = {
+            "ts": int(evt[0]),
+            "ld": int(round(float(evt[1]))),
+            "se": int(round(float(evt[2]))),
+        }
+        if not strike_values_are_sane(s):
+            print("Rejected out-of-range evt_strike payload:", s)
+            sanity_reject_count += 1
+            return None
+        return s
+    except Exception as e:
+        print("evt_strike field parse error:", e)
+        sanity_reject_count += 1
+        return None
 
 
-def commit_forward_success():
-    global last_forward_tick_ms, last_valid_weather_tick_ms
-    last_forward_tick_ms = time.ticks_ms()
-    last_valid_weather_tick_ms = last_forward_tick_ms
+def parse_device_status(packet_obj):
+    global sanity_reject_count
+
+    try:
+        d = {
+            "ts": int(packet_obj.get("timestamp")),
+            "up": int(packet_obj.get("uptime")),
+            "v": round(float(packet_obj.get("voltage")), 2),
+            "fw": packet_obj.get("firmware_revision"),
+            "r": int(packet_obj.get("rssi")),
+            "hr": int(packet_obj.get("hub_rssi")),
+            "ss": int(packet_obj.get("sensor_status")),
+            "dbg": int(packet_obj.get("debug")),
+        }
+        if not device_status_values_are_sane(d):
+            print("Rejected out-of-range device_status payload:", d)
+            sanity_reject_count += 1
+            return None
+        return d
+    except Exception as e:
+        print("device_status field parse error:", e)
+        sanity_reject_count += 1
+        return None
+
+
+def parse_hub_status(packet_obj):
+    global sanity_reject_count
+
+    try:
+        h = {
+            "ts": int(packet_obj.get("timestamp")),
+            "up": int(packet_obj.get("uptime")),
+            "fw": packet_obj.get("firmware_revision"),
+            "r": int(packet_obj.get("rssi")),
+            "rf": packet_obj.get("reset_flags", ""),
+            "seq": int(packet_obj.get("seq")),
+            "fs": packet_obj.get("fs", []),
+            "rs": packet_obj.get("radio_stats", []),
+            "ms": packet_obj.get("mqtt_stats", []),
+        }
+        if not hub_status_values_are_sane(h):
+            print("Rejected out-of-range hub_status payload:", h)
+            sanity_reject_count += 1
+            return None
+        return h
+    except Exception as e:
+        print("hub_status field parse error:", e)
+        sanity_reject_count += 1
+        return None
+
+
+def parse_supported_packet(packet_obj):
+    global unsupported_type_count
+
+    packet_type = packet_obj.get("type")
+
+    if packet_type == "obs_st":
+        return "obs_st", parse_obs_st(packet_obj)
+
+    if packet_type == "evt_precip":
+        return "evt_precip", parse_evt_precip(packet_obj)
+
+    if packet_type == "evt_strike":
+        return "evt_strike", parse_evt_strike(packet_obj)
+
+    if packet_type == "device_status":
+        return "device_status", parse_device_status(packet_obj)
+
+    if packet_type == "hub_status":
+        return "hub_status", parse_hub_status(packet_obj)
+
+    unsupported_type_count += 1
+    return None, None
 
 
 # ----------------------------
@@ -490,10 +791,11 @@ def uart_send_json(payload):
     blink(1, 0.15, 0.05)
 
 
-def send_weather_to_rak(weather):
+def send_obs_st_to_rak(weather):
     global msg_id
 
     payload = {
+        "et": "obs_st",
         "i": msg_id,
         "ts": weather["ts"],
         "t": weather["t"],
@@ -522,6 +824,99 @@ def send_weather_to_rak(weather):
     msg_id += 1
 
 
+def send_evt_precip_to_rak(evt):
+    global msg_id
+
+    payload = {
+        "et": "evt_precip",
+        "i": msg_id,
+        "ts": evt["ts"],
+    }
+
+    uart_send_json(payload)
+    msg_id += 1
+
+
+def send_evt_strike_to_rak(evt):
+    global msg_id
+
+    payload = {
+        "et": "evt_strike",
+        "i": msg_id,
+        "ts": evt["ts"],
+        "ld": evt["ld"],
+        "se": evt["se"],
+    }
+
+    uart_send_json(payload)
+    msg_id += 1
+
+
+def send_device_status_to_rak(dev):
+    global msg_id
+
+    payload = {
+        "et": "device_status",
+        "i": msg_id,
+        "ts": dev["ts"],
+        "up": dev["up"],
+        "v": dev["v"],
+        "fw": dev["fw"],
+        "r": dev["r"],
+        "hr": dev["hr"],
+        "ss": dev["ss"],
+        "dbg": dev["dbg"],
+    }
+
+    uart_send_json(payload)
+    msg_id += 1
+
+
+def send_hub_status_to_rak(hub):
+    global msg_id
+
+    payload = {
+        "et": "hub_status",
+        "i": msg_id,
+        "ts": hub["ts"],
+        "up": hub["up"],
+        "fw": hub["fw"],
+        "r": hub["r"],
+        "rf": hub["rf"],
+        "seq": hub["seq"],
+        "fs": hub["fs"],
+        "rs": hub["rs"],
+        "ms": hub["ms"],
+    }
+
+    uart_send_json(payload)
+    msg_id += 1
+
+
+def send_forward_item(kind, data):
+    if kind == "obs_st":
+        send_obs_st_to_rak(data)
+        return
+
+    if kind == "evt_precip":
+        send_evt_precip_to_rak(data)
+        return
+
+    if kind == "evt_strike":
+        send_evt_strike_to_rak(data)
+        return
+
+    if kind == "device_status":
+        send_device_status_to_rak(data)
+        return
+
+    if kind == "hub_status":
+        send_hub_status_to_rak(data)
+        return
+
+    raise RuntimeError("Unsupported forward kind: {}".format(kind))
+
+
 def maybe_send_heartbeat(wlan):
     global last_heartbeat_tick_ms, msg_id
 
@@ -531,6 +926,9 @@ def maybe_send_heartbeat(wlan):
     if last_heartbeat_tick_ms is not None:
         if time.ticks_diff(now_tick, last_heartbeat_tick_ms) < interval_ms:
             return False
+
+    if not may_uart_send_now():
+        return False
 
     try:
         ip = wlan.ifconfig()[0] if wifi_is_connected(wlan) else "0.0.0.0"
@@ -546,9 +944,13 @@ def maybe_send_heartbeat(wlan):
         "pm": get_wifi_pm_value(wlan),
         "udp": udp_packet_count,
         "jerr": json_error_count,
-        "nobs": non_obs_count,
+        "unsup": unsupported_type_count,
         "rej": sanity_reject_count,
         "skip": rate_limit_skip_count,
+        "qsz": len(outbound_queue),
+        "qrepl": queue_replace_count,
+        "qdrop": queue_drop_count,
+        "fwd": forwarded_count,
         "sockrec": socket_recreate_count,
         "wifirec": wifi_reconnect_count,
         "sockerr": socket_error_count,
@@ -560,6 +962,7 @@ def maybe_send_heartbeat(wlan):
 
     uart_send_json(payload)
     msg_id += 1
+    commit_uart_send()
     last_heartbeat_tick_ms = now_tick
     return True
 
@@ -569,7 +972,7 @@ def maybe_send_heartbeat(wlan):
 # ----------------------------
 def main():
     global consecutive_main_loop_failures
-    global udp_packet_count, json_error_count, rate_limit_skip_count, last_any_udp_tick_ms
+    global udp_packet_count, json_error_count, last_any_udp_tick_ms
     global socket_error_count
 
     cause_num, cause_name = reset_cause_name()
@@ -593,6 +996,10 @@ def main():
                 print("Recreating UDP listener after Wi-Fi reconnect...")
                 sock = recreate_udp_listener(sock, UDP_PORT)
 
+            # Opportunistically drain one queued item before blocking on recvfrom()
+            maybe_send_next_queued()
+
+            # Heartbeat is low frequency and also respects UART send gap
             maybe_send_heartbeat(wlan)
 
             data, addr = sock.recvfrom(2048)
@@ -614,24 +1021,33 @@ def main():
                 json_error_count += 1
                 continue
 
-            weather = parse_obs_st(packet_obj)
-            if weather is None:
+            kind, parsed = parse_supported_packet(packet_obj)
+            if kind is None or parsed is None:
                 continue
 
-            if not may_forward_now():
-                rate_limit_skip_count += 1
-                continue
+            if enqueue_forward_item(kind, parsed):
+                print("Queued", kind, "queue_size=", len(outbound_queue))
+            else:
+                print("Skipped", kind, "(rate-limited or dropped)")
 
-            print("Parsed obs_st:", weather)
+            # Try to send one item after enqueue as well
+            maybe_send_next_queued()
 
-            send_weather_to_rak(weather)
-            commit_forward_success()
             consecutive_main_loop_failures = 0
 
         except OSError as e:
             if is_socket_timeout_error(e):
                 register_healthy_no_udp_progress()
+
+                # Even with no UDP arriving, continue draining the queue slowly
+                try:
+                    maybe_send_next_queued()
+                    maybe_send_heartbeat(wlan)
+                except Exception as send_e:
+                    print("Send during timeout loop failed:", send_e)
+
                 wlan, sock = maybe_trigger_no_udp_recovery(wlan, sock)
+
             else:
                 consecutive_main_loop_failures += 1
                 socket_error_count += 1

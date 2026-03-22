@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""Listen to a local Meshtastic radio and emit structured JSON logs.
+
+This script connects to the Meshtastic device identified by the
+`MESHTASTIC_DEVICE` environment variable, subscribes to packet, text, and
+connection lifecycle events from the Meshtastic pubsub interface, and prints
+each event to stdout as a JSON record with a UTC timestamp. It stays in a
+simple reconnect loop so the process can recover from temporary disconnects,
+and it exits cleanly when SIGINT or SIGTERM is received.
+"""
 from __future__ import annotations
 
 import json
