@@ -11,7 +11,7 @@ The primary production reference is [`documentation/markdown/weather_station_mvp
 ## Project Links
 
 - Hackaday project page: https://hackaday.io/project/205363-meshtastic-weather-station
-- Live demo: https://brahmschultz.com/meshtastic-weather-station
+- Live demo: https://www.brahmschultz.com/meshtastic-weather-station
 
 ## Production Overview
 
