@@ -9,3 +9,5 @@ env/
 .python-version
 
 *.log
+*.zip
+*.tar.gz

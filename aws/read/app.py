@@ -1,10 +1,9 @@
 import os
 import json
-import re
-from decimal import Decimal
-from datetime import datetime, timezone
+import base64
 
 import boto3
+from decimal import Decimal
 from boto3.dynamodb.types import TypeDeserializer
 
 ddb = boto3.client("dynamodb")
@@ -13,7 +12,11 @@ deserializer = TypeDeserializer()
 TABLE_NAME = os.environ["TABLE_NAME"]
 ALLOWED_CORS_ORIGIN = os.environ.get("ALLOWED_CORS_ORIGIN", "*")
 
-NUMERIC_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+RAW_LIMIT_DEFAULT = 200
+RAW_LIMIT_MAX = 1000
+SAMPLE_MAX = 2000
+SAMPLE_SCAN_PAGE_SIZE = 1000
+SAMPLE_MAX_SCAN_ITEMS = 50000
 
 
 def json_safe(value):
@@ -52,68 +55,130 @@ def get_query(event):
     return event.get("queryStringParameters") or {}
 
 
-def format_utc(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+def parse_int(name, raw_value, min_value=None, max_value=None):
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name}_must_be_integer")
+
+    if min_value is not None and value < min_value:
+        raise ValueError(f"{name}_must_be_at_least_{min_value}")
+
+    if max_value is not None and value > max_value:
+        raise ValueError(f"{name}_must_be_at_most_{max_value}")
+
+    return value
 
 
-def normalize_epoch_seconds(value: Decimal) -> Decimal:
-    magnitude = abs(value)
-
-    if magnitude >= Decimal("100000000000000"):  # microseconds
-        return value / Decimal("1000000")
-
-    if magnitude >= Decimal("100000000000"):  # milliseconds
-        return value / Decimal("1000")
-
-    return value  # seconds
+def encode_next_token(last_evaluated_key):
+    if not last_evaluated_key:
+        return None
+    raw = json.dumps(last_evaluated_key).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8")
 
 
-def normalize_timestamp_to_sortable_utc(value, field_name: str) -> str:
-    if value is None:
-        raise ValueError(f"{field_name} is required")
+def decode_next_token(token):
+    if not token:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise ValueError("invalid_nextToken")
 
-    if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be an ISO-8601 UTC string or epoch number")
 
-    if isinstance(value, (int, Decimal)):
-        numeric_value = normalize_epoch_seconds(Decimal(str(value)))
-        if numeric_value < 0:
-            raise ValueError(f"{field_name} epoch must be non-negative")
-        try:
-            dt = datetime.fromtimestamp(float(numeric_value), tz=timezone.utc)
-        except Exception:
-            raise ValueError(f"{field_name} epoch is out of range")
-        return format_utc(dt)
+def query_history_page(
+    pk,
+    sk_from,
+    sk_to,
+    *,
+    limit=None,
+    ascending=False,
+    exclusive_start_key=None,
+    projection=False,
+):
+    kwargs = {
+        "TableName": TABLE_NAME,
+        "KeyConditionExpression": "pk = :pk AND sk BETWEEN :from AND :to",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": pk},
+            ":from": {"S": sk_from},
+            ":to": {"S": sk_to},
+        },
+        "ScanIndexForward": ascending,
+    }
 
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            raise ValueError(f"{field_name} must not be empty")
+    if limit is not None:
+        kwargs["Limit"] = limit
 
-        if NUMERIC_RE.match(raw):
-            numeric_value = normalize_epoch_seconds(Decimal(raw))
-            if numeric_value < 0:
-                raise ValueError(f"{field_name} epoch must be non-negative")
-            try:
-                dt = datetime.fromtimestamp(float(numeric_value), tz=timezone.utc)
-            except Exception:
-                raise ValueError(f"{field_name} epoch is out of range")
-            return format_utc(dt)
+    if exclusive_start_key:
+        kwargs["ExclusiveStartKey"] = exclusive_start_key
 
-        iso_candidate = raw.replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(iso_candidate)
-        except ValueError:
-            raise ValueError(
-                f"{field_name} must be an ISO-8601 UTC string like 2026-03-18T00:45:46.982324Z "
-                f"or an epoch number"
-            )
+    if projection:
+        kwargs["ProjectionExpression"] = (
+            "pk, sk, record_type, source_node_id, source_name, msg_id, "
+            "source_ts_utc, received_at_utc, weather"
+        )
 
-        if dt.tzinfo is None:
-            raise ValueError(f"{field_name} must include timezone information")
-        return format_utc(dt)
+    return ddb.query(**kwargs)
 
-    raise ValueError(f"{field_name} must be an ISO-8601 UTC string or epoch number")
+
+def evenly_sample_items(items, sample_size):
+    total = len(items)
+
+    if sample_size >= total:
+        return items
+
+    if sample_size == 1:
+        return [items[total // 2]]
+
+    selected_indices = []
+    seen = set()
+
+    for i in range(sample_size):
+        idx = round(i * (total - 1) / (sample_size - 1))
+        if idx not in seen:
+            selected_indices.append(idx)
+            seen.add(idx)
+
+    if len(selected_indices) < sample_size:
+        for idx in range(total):
+            if idx not in seen:
+                selected_indices.append(idx)
+                seen.add(idx)
+                if len(selected_indices) == sample_size:
+                    break
+        selected_indices.sort()
+
+    return [items[idx] for idx in selected_indices]
+
+
+def fetch_all_items_for_sampling(pk, sk_from, sk_to, max_scan_items=SAMPLE_MAX_SCAN_ITEMS):
+    items = []
+    last_evaluated_key = None
+
+    while True:
+        res = query_history_page(
+            pk,
+            sk_from,
+            sk_to,
+            limit=SAMPLE_SCAN_PAGE_SIZE,
+            ascending=True,
+            exclusive_start_key=last_evaluated_key,
+            projection=True,
+        )
+
+        page_items = [normalize_item(x) for x in res.get("Items", [])]
+        items.extend(page_items)
+
+        if len(items) > max_scan_items:
+            raise ValueError("sample_window_too_large")
+
+        last_evaluated_key = res.get("LastEvaluatedKey")
+        if not last_evaluated_key:
+            break
+
+    return items
 
 
 def handle_get_latest(event):
@@ -140,49 +205,93 @@ def handle_get_latest(event):
 
 def handle_get_history(event):
     q = get_query(event)
+
     station_id = q.get("stationId")
     from_ts = q.get("from")
     to_ts = q.get("to")
-    limit_raw = q.get("limit", "200")
 
     if not station_id or not from_ts or not to_ts:
         return response(400, {"ok": False, "error": "missing_stationId_from_to"})
 
-    try:
-        limit = int(limit_raw)
-    except ValueError:
-        return response(400, {"ok": False, "error": "limit_must_be_integer"})
-
-    if limit < 1 or limit > 1000:
-        return response(400, {"ok": False, "error": "limit_must_be_between_1_and_1000"})
+    limit_raw = q.get("limit", str(RAW_LIMIT_DEFAULT))
+    sample_raw = q.get("sample")
+    next_token_raw = q.get("nextToken")
+    order = (q.get("order") or "").lower()
 
     try:
-        from_sort_utc = normalize_timestamp_to_sortable_utc(from_ts, "from")
-        to_sort_utc = normalize_timestamp_to_sortable_utc(to_ts, "to")
-    except ValueError as e:
-        return response(400, {"ok": False, "error": "invalid_time_range", "details": [str(e)]})
+        limit = parse_int("limit", limit_raw, 1, RAW_LIMIT_MAX)
+    except ValueError as exc:
+        return response(400, {"ok": False, "error": str(exc)})
 
-    if from_sort_utc > to_sort_utc:
-        return response(400, {"ok": False, "error": "from_must_be_less_than_or_equal_to_to"})
+    sample = None
+    if sample_raw is not None:
+        try:
+            sample = parse_int("sample", sample_raw, 1, SAMPLE_MAX)
+        except ValueError as exc:
+            return response(400, {"ok": False, "error": str(exc)})
+
+    try:
+        exclusive_start_key = decode_next_token(next_token_raw) if next_token_raw else None
+    except ValueError as exc:
+        return response(400, {"ok": False, "error": str(exc)})
 
     pk = "STATION#" + str(station_id)
-    sk_from = "OBS#" + from_sort_utc + "#"
-    sk_to = "OBS#" + to_sort_utc + "~"
+    sk_from = "OBS#" + str(from_ts)
+    sk_to = "OBS#" + str(to_ts) + "~"
 
-    res = ddb.query(
-        TableName=TABLE_NAME,
-        KeyConditionExpression="pk = :pk AND sk BETWEEN :from AND :to",
-        ExpressionAttributeValues={
-            ":pk": {"S": pk},
-            ":from": {"S": sk_from},
-            ":to": {"S": sk_to},
-        },
-        Limit=limit,
-        ScanIndexForward=False,
+    if sample is not None:
+        try:
+            all_items = fetch_all_items_for_sampling(pk, sk_from, sk_to)
+        except ValueError as exc:
+            return response(400, {"ok": False, "error": str(exc)})
+
+        sampled_items = evenly_sample_items(all_items, sample)
+
+        return response(
+            200,
+            {
+                "ok": True,
+                "mode": "sampled",
+                "stationId": station_id,
+                "from": from_ts,
+                "to": to_ts,
+                "sampleRequested": sample,
+                "totalMatched": len(all_items),
+                "count": len(sampled_items),
+                "items": sampled_items,
+            },
+        )
+
+    ascending = order == "asc"
+
+    res = query_history_page(
+        pk,
+        sk_from,
+        sk_to,
+        limit=limit,
+        ascending=ascending,
+        exclusive_start_key=exclusive_start_key,
+        projection=False,
     )
 
     items = [normalize_item(x) for x in res.get("Items", [])]
-    return response(200, {"ok": True, "count": len(items), "items": items})
+    next_token = encode_next_token(res.get("LastEvaluatedKey"))
+
+    body = {
+        "ok": True,
+        "mode": "raw",
+        "stationId": station_id,
+        "from": from_ts,
+        "to": to_ts,
+        "order": "asc" if ascending else "desc",
+        "count": len(items),
+        "items": items,
+    }
+
+    if next_token:
+        body["nextToken"] = next_token
+
+    return response(200, body)
 
 
 def handler(event, context):

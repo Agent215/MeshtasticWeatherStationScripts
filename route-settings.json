@@ -4,7 +4,7 @@
     "ThrottlingRateLimit": 1
   },
   "GET /observations": {
-    "ThrottlingBurstLimit": 2,
-    "ThrottlingRateLimit": 0.2
+    "ThrottlingBurstLimit": 7,
+    "ThrottlingRateLimit": 2
   }
 }
