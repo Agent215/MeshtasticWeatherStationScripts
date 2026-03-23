@@ -116,18 +116,20 @@ This section explicitly defines how each device communicates with the device imm
 | Tempest sensor \-\> Tempest hub | Vendor wireless radio link | WeatherFlow internal link | Bidirectional vendor-managed | No user configuration beyond normal Tempest setup | Treat as appliance behavior; not part of custom coding work. |
 | Tempest hub \<-\> garden router | 2.4 GHz Wi-Fi | IP over Wi-Fi | Hub joins LAN as client | Router provides local SSID and DHCP | Internet is not required for local UDP broadcast collection. |
 | Pico W \<-\> garden router | 2.4 GHz Wi-Fi | IP over Wi-Fi | Pico joins LAN as client | Same SSID/subnet as Tempest hub | Pico must be on the same local LAN as the hub to hear the UDP broadcasts. |
-| Tempest hub \-\> Pico W | Local LAN | UDP broadcast, JSON payloads | One-way broadcast from hub | Listen on UDP port 50222; message types include obs\_st and rapid\_wind | Preferred source of weather data for the garden node. No cloud token required. |
+| Tempest hub \-\> Pico W | Local LAN | UDP broadcast, JSON payloads | One-way broadcast from hub | Listen on UDP port 50222; current bridge support includes `obs_st`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status` | Preferred source of weather data for the garden node. No cloud token required. |
 | Pico W \<-\> garden Meshtastic node | 3-wire UART \+ shared ground | UART serial | Primarily Pico TX \-\> node RX; optional reverse path | 3.3 V logic, suggested 115200 baud, 8N1, connect TX\<-\>RX and GND\<-\>GND | Do not feed 5 V logic into the RAK UART pins. Power voltage and UART logic level are different concepts. |
 | Garden Meshtastic node \<-\> home Meshtastic node | LoRa radio via antennas | Meshtastic over LoRa | Bidirectional | Region: United States / US915; same primary channel and PSK on both nodes | Bench testing confirmed message exchange once region/channel matched. Node list metadata may lag even when messages pass. |
 | Home Meshtastic node \<-\> Raspberry Pi | USB-C cable | USB serial / Meshtastic host interface | Bidirectional | Use USB for both power and host communication | Recommended over Bluetooth for reliability and easier debugging. |
-| Raspberry Pi \<-\> AWS | Home internet connection | HTTPS | Bidirectional request/response | POST latest weather payloads to API endpoint | Keep cloud auth and internet-facing logic on the house side, not in the garden node. |
+| Raspberry Pi \<-\> AWS | Home internet connection | HTTPS | Bidirectional request/response | POST weather observations to the ingest API and query latest/history from the read API | Keep cloud auth and internet-facing logic on the house side, not in the garden node. |
 | Website \<-\> AWS API | Internet | HTTPS GET / JSON | Request/response | Simple polling is recommended initially | WebSockets can be added later if desired but are not required for MVP. |
 
 # 6. Data models and packet formats
 
 ## 6.1 Tempest UDP packets consumed by the Pico
 
-The Pico should start by listening for any packet on UDP 50222, then narrow to the specific message types used by the application. For the MVP, the most important are the full observation packet and the rapid wind packet.
+Current script-backed note: the checked-in Pico bridge listens on UDP port `50222` and supports `obs_st`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`. The full `obs_st` array currently carries 22 values in this order: `epoch_s`, `wind_lull_ms`, `wind_avg_ms`, `wind_gust_ms`, `wind_dir_deg`, `wind_sample_interval_s`, `pressure_hpa`, `temp_c`, `humidity_pct`, `illuminance_lux`, `uv_index`, `solar_wm2`, `rain_mm`, `precip_type`, `lightning_km`, `lightning_count`, `battery_v`, `report_interval_min`, `local_day_rain_mm`, `nearcast_rain_mm`, `local_day_nearcast_rain_mm`, and `precip_analysis_type`.
+
+The current bridge ignores `rapid_wind`; forwarded weather observations are built from `obs_st`.
 
 | {  "type": "obs\_st",  "obs": \[\[ epoch\_s, wind\_lull\_ms, wind\_avg\_ms, wind\_gust\_ms, wind\_dir\_deg, wind\_sample\_interval\_s, pressure\_hpa, temp\_c, humidity\_pct, illuminance\_lux, uv\_index, solar\_wm2, rain\_mm, precip\_type, lightning\_km, lightning\_count, battery\_v, report\_interval\_min \]\]} |
 | :---- |
@@ -136,7 +138,15 @@ Suggested MVP field extraction from obs\_st: timestamp, average wind, wind direc
 
 ## 6.2 Pico to Meshtastic payload format
 
-During early bring-up, use short numbered plain-text messages such as pico-test-0001. Once the UART and radio chain is proven, switch to a compact JSON payload. Keep the payload small and stable so debugging on the home gateway remains easy.
+Current script-backed note: the Pico now sends one compact JSON object per UART line. The primary weather payload shape is `{"et":"obs_st","i":17,"ts":1741985112,"t":22.5,"h":52,"p":1011.4,"w":3.4,"g":5.2,"l":1.1,"d":230,"r":0.0,"uv":2.4,"sr":410.0,"lux":12500,"bat":2.48,"ld":0.0,"lc":0,"pt":0,"ri":1,"rd":0.0,"nr":0.0,"nrd":0.0,"pa":0}`.
+
+Other forwarded UART payloads use these field sets:
+
+* `evt_precip`: `et`, `i`, `ts`  
+* `evt_strike`: `et`, `i`, `ts`, `ld`, `se`  
+* `device_status`: `et`, `i`, `ts`, `up`, `v`, `fw`, `r`, `hr`, `ss`, `dbg`  
+* `hub_status`: `et`, `i`, `ts`, `up`, `fw`, `r`, `rf`, `seq`, `fs`, `rs`, `ms`  
+* heartbeat/debug: `sys`, `i`, `up`, `ip`, `wc`, `pm`, `udp`, `jerr`, `unsup`, `rej`, `skip`, `qsz`, `qrepl`, `qdrop`, `fwd`, `sockrec`, `wifirec`, `sockerr`, `nwu`, `last_udp_s`, `last_obs_s`, `last_ok_s`
 
 | {  "msg\_id": 12,  "ts": 1772841600,  "temp\_c": 22.4,  "hum": 55,  "pres\_hpa": 1012.7,  "wind\_ms": 3.1,  "wind\_dir": 245,  "rain\_mm": 0.0} |
 | :---- |
@@ -145,7 +155,7 @@ Recommended UART framing rule for bench testing: one JSON object per line termin
 
 ## 6.3 Home gateway parsing model
 
-The Raspberry Pi should treat the home Meshtastic node as the source of received packets. The gateway service should log raw packets first, then parse JSON second, then hand the parsed object to storage or AWS upload logic. This layered approach makes field-level bugs easier to isolate.
+The Raspberry Pi should treat the home Meshtastic node as the source of received packets. The gateway service should log raw packets first, then parse JSON second, then branch first on `et` or `sys` before handing the parsed object to local storage or AWS upload logic. Only weather observations belong on the current AWS ingest route.
 
 # 7. Power architecture
 
@@ -220,7 +230,7 @@ This design provides the following benefits:
 
 * Very low monthly operating cost at the expected traffic volume  
 * Good performance for small payloads and simple reads/writes  
-* Strong security using AWS IAM for authenticated write access  
+* Strong security using the shared-secret header required by the ingest API  
 * Minimal operational overhead  
   Easy deployment and repeatability using CloudFormation templates  
 * Easy future expansion for alerts, dashboards, or analytics
@@ -260,15 +270,15 @@ API Gateway should expose the HTTPS endpoints used by the Raspberry Pi and viewe
 Recommended routes:
 
 * `POST /observations`  
-* `GET /observations/latest`  
-* `GET /observations?from=...&to=...`
+* `GET /observations/latest?stationId=...`  
+* `GET /observations?stationId=...&from=...&to=...`
 
 Why HTTP API:
 
 * lower cost than REST API  
 * lower latency  
 * sufficient for this use case  
-* supports IAM authorization for write endpoints
+* matches the current shared-secret header scheme used by the checked-in ingest Lambda
 
 ### 2. AWS Lambda
 
@@ -278,15 +288,16 @@ Recommended functions:
 
 * **Ingest function**
 
-  * accepts posted weather data  
-  * validates schema  
-  * writes to DynamoDB  
+  * accepts a JSON body shaped as `{"payload": {...}}`  
+  * requires the `x-weatherstation-key` header  
+  * validates timestamps and recognized weather fields  
   * updates the “latest” record
 
 * **Read function**
 
-  * fetches the latest record  
-  * optionally queries a historical time range
+  * fetches the `LATEST` item for one station  
+  * queries a historical time range for one station  
+  * supports `limit`, `nextToken`, `order`, and optional evenly sampled history via `sample`
 
 Lambda is appropriate because:
 
@@ -297,22 +308,22 @@ Lambda is appropriate because:
 
 ### 3. Amazon DynamoDB
 
-DynamoDB should store both time-series weather data and the latest reading.
+DynamoDB should store both time-series weather data and the latest reading in a single table.
 
 Recommended table design:
 
 * **Table name:** `WeatherObservations`  
-* **Partition key:** `stationId`  
-* **Sort key:** `timestamp`
+* **Partition key:** `pk = STATION#<source_node_id>`  
+* **Sort key:** `sk`
 
-This allows efficient retrieval of all readings for a station over time.
+Current sort-key patterns:
 
-A second pattern should also be used for fast current reads:
+* history item: `OBS#<normalized_source_ts_utc>#WEATHER`  
 
-* store a special item such as `recordType = latest`  
+* latest item: `LATEST`
 * or use a separate “latest” table if preferred
 
-For this project, a single table with a special latest item is usually sufficient and simpler.
+The current checked-in AWS stack uses the single-table pattern above; a separate latest table is not used.
 
 ### 4. CloudWatch
 

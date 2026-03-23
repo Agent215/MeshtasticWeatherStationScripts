@@ -29,6 +29,7 @@ The primary production reference is [`documentation/markdown/weather_station_mvp
 - [`aws/read/app.py`](./aws/read/app.py): read Lambda for `GET /observations` and `GET /observations/latest`
 - [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml): source CloudFormation template
 - [`aws/packaged-template.yaml`](./aws/packaged-template.yaml): packaged CloudFormation template
+- [`swagger.yml`](./swagger.yml): OpenAPI description for the current AWS HTTP API
 - [`mocks/mock_tempest_udp_sender.py`](./mocks/mock_tempest_udp_sender.py): mock Tempest `obs_st` UDP sender
 - [`mocks/mock_tempest_udp_sender_extended.py`](./mocks/mock_tempest_udp_sender_extended.py): mock Tempest sender for `obs_st`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`
 - [`mocks/ecowitt_mock_server_v3.py`](./mocks/ecowitt_mock_server_v3.py): mock Ecowitt LAN API server for local integration work
@@ -237,6 +238,7 @@ Deploy [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml) or [
 
 ## Documentation
 
+- [`swagger.yml`](./swagger.yml) describes the current AWS HTTP API contract for `POST /observations`, `GET /observations`, and `GET /observations/latest`.
 - [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md) is the current source of truth for the production home-server and AWS design.
 - [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md) captures the broader system and hardware plan.
 - [`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md) is useful background, but the MVP architecture document supersedes it for the current production schema and cloud flow.

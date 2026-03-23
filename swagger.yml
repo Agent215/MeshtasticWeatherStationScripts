@@ -1,0 +1,754 @@
+openapi: 3.0.3
+info:
+  title: Weather Station HTTP API
+  version: 1.0.0
+  description: |
+    OpenAPI description for the currently implemented AWS HTTP API.
+
+    The ingest lambda accepts only `POST /observations`.
+    The read lambda serves `GET /observations/latest` and `GET /observations`.
+servers:
+  - url: /
+tags:
+  - name: ingest
+  - name: read
+paths:
+  /observations:
+    post:
+      tags:
+        - ingest
+      summary: Ingest a weather observation
+      description: |
+        Creates a history observation row and updates the `LATEST` row when the
+        incoming `source_ts_utc` is newer than or equal to the current latest.
+
+        Authentication is handled with the `x-weatherstation-key` header.
+      security:
+        - WeatherStationKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestObservationRequest'
+      responses:
+        '200':
+          description: Observation accepted or deduplicated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+              examples:
+                accepted:
+                  value:
+                    ok: true
+                    deduped: false
+                    source_node_id: garden-node-01
+                    msg_id: 1742666412
+                    source_ts_utc: '2026-03-18T00:45:46.982324Z'
+                    observation_sk: 'OBS#2026-03-18T00:45:46.982324Z#WEATHER'
+                deduped:
+                  value:
+                    ok: true
+                    deduped: true
+                    source_node_id: garden-node-01
+                    msg_id: 1742666412
+                    source_ts_utc: '2026-03-18T00:45:46.982324Z'
+                    observation_sk: 'OBS#2026-03-18T00:45:46.982324Z#WEATHER'
+        '400':
+          description: Invalid JSON or validation failure.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - $ref: '#/components/schemas/ValidationErrorResponse'
+              examples:
+                invalidJson:
+                  value:
+                    ok: false
+                    error: invalid_json
+                validationFailed:
+                  value:
+                    ok: false
+                    error: validation_failed
+                    details:
+                      - payload.source_node_id is required and must be a string
+                      - payload.received_at_utc must include timezone information
+        '401':
+          description: Missing or invalid shared secret.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                ok: false
+                error: unauthorized
+
+    get:
+      tags:
+        - read
+      summary: Get observation history
+      description: |
+        Returns either a raw paged history window or an evenly sampled result set.
+
+        `from` and `to` are used directly in the DynamoDB sort-key range lookup.
+        They are not normalized by the read lambda, so they should match the
+        stored UTC-sortable timestamp format produced by ingest.
+      parameters:
+        - $ref: '#/components/parameters/StationId'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Order'
+        - $ref: '#/components/parameters/NextToken'
+        - $ref: '#/components/parameters/Sample'
+      responses:
+        '200':
+          description: Raw or sampled history response.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/RawHistoryResponse'
+                  - $ref: '#/components/schemas/SampledHistoryResponse'
+              examples:
+                raw:
+                  value:
+                    ok: true
+                    mode: raw
+                    stationId: garden-node-01
+                    from: '2026-03-18T00:00:00.000000Z'
+                    to: '2026-03-18T23:59:59.999999Z'
+                    order: desc
+                    count: 2
+                    items:
+                      - pk: STATION#garden-node-01
+                        sk: OBS#2026-03-18T00:46:46.982324Z#WEATHER
+                        record_type: observation
+                        observation_type: WEATHER
+                        source_node_id: garden-node-01
+                        source_name: garden-node
+                        msg_id: 1742666472
+                        source_ts_utc: '2026-03-18T00:46:46.982324Z'
+                        source_ts_raw: '2026-03-18T00:46:46.982324Z'
+                        source_ts_sort_utc: '2026-03-18T00:46:46.982324Z'
+                        received_at_utc: '2026-03-18T00:46:48.000000Z'
+                        weather:
+                          air_temp_c: 14.8
+                          relative_humidity_pct: 61
+                          station_pressure_hpa: 1012.6
+                        raw_payload:
+                          payload:
+                            source_node_id: garden-node-01
+                            msg_id: 1742666472
+                            source_ts_utc: '2026-03-18T00:46:46.982324Z'
+                            received_at_utc: '2026-03-18T00:46:48.000000Z'
+                            weather:
+                              air_temp_c: 14.8
+                        ingested_at_utc: '2026-03-18T00:46:48.231456Z'
+                sampled:
+                  value:
+                    ok: true
+                    mode: sampled
+                    stationId: garden-node-01
+                    from: '2026-03-18T00:00:00.000000Z'
+                    to: '2026-03-18T23:59:59.999999Z'
+                    sampleRequested: 3
+                    totalMatched: 1440
+                    count: 3
+                    items:
+                      - pk: STATION#garden-node-01
+                        sk: OBS#2026-03-18T00:00:46.982324Z#WEATHER
+                        record_type: observation
+                        source_node_id: garden-node-01
+                        source_name: garden-node
+                        msg_id: 1742664046
+                        source_ts_utc: '2026-03-18T00:00:46.982324Z'
+                        received_at_utc: '2026-03-18T00:00:48.000000Z'
+                        weather:
+                          air_temp_c: 14.1
+        '400':
+          description: Missing parameters or invalid paging or sampling request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingRequired:
+                  value:
+                    ok: false
+                    error: missing_stationId_from_to
+                invalidLimit:
+                  value:
+                    ok: false
+                    error: limit_must_be_at_most_1000
+                invalidNextToken:
+                  value:
+                    ok: false
+                    error: invalid_nextToken
+
+  /observations/latest:
+    get:
+      tags:
+        - read
+      summary: Get the latest observation for a station
+      parameters:
+        - $ref: '#/components/parameters/StationId'
+      responses:
+        '200':
+          description: Latest observation item.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LatestResponse'
+              example:
+                ok: true
+                item:
+                  pk: STATION#garden-node-01
+                  sk: LATEST
+                  record_type: latest
+                  observation_type: WEATHER
+                  source_node_id: garden-node-01
+                  source_name: garden-node
+                  msg_id: 1742666472
+                  source_ts_utc: '2026-03-18T00:46:46.982324Z'
+                  source_ts_raw: '2026-03-18T00:46:46.982324Z'
+                  source_ts_sort_utc: '2026-03-18T00:46:46.982324Z'
+                  received_at_utc: '2026-03-18T00:46:48.000000Z'
+                  weather:
+                    air_temp_c: 14.8
+                    relative_humidity_pct: 61
+                    station_pressure_hpa: 1012.6
+                  latest_observation_sk: 'OBS#2026-03-18T00:46:46.982324Z#WEATHER'
+                  updated_at_utc: '2026-03-18T00:46:48.231789Z'
+        '400':
+          description: Missing station identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                ok: false
+                error: missing_stationId
+        '404':
+          description: No latest row exists for the requested station.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                ok: false
+                error: not_found
+components:
+  securitySchemes:
+    WeatherStationKey:
+      type: apiKey
+      in: header
+      name: x-weatherstation-key
+      description: Shared secret required by `POST /observations`.
+
+  parameters:
+    StationId:
+      name: stationId
+      in: query
+      required: true
+      description: Station or node identifier used to build `pk = STATION#<stationId>`.
+      schema:
+        type: string
+    From:
+      name: from
+      in: query
+      required: true
+      description: |
+        Inclusive lower bound for the observation range. This value is used
+        directly in the sort-key prefix query as `OBS#<from>`.
+      schema:
+        type: string
+        example: '2026-03-18T00:00:00.000000Z'
+    To:
+      name: to
+      in: query
+      required: true
+      description: |
+        Inclusive upper bound for the observation range. This value is used
+        directly in the sort-key prefix query as `OBS#<to>~`.
+      schema:
+        type: string
+        example: '2026-03-18T23:59:59.999999Z'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of raw history items to return.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 200
+    Order:
+      name: order
+      in: query
+      required: false
+      description: Use `asc` for ascending results. Any other value behaves as descending.
+      schema:
+        type: string
+        default: desc
+        example: desc
+    NextToken:
+      name: nextToken
+      in: query
+      required: false
+      description: Base64url-encoded DynamoDB `LastEvaluatedKey` from a prior raw history response.
+      schema:
+        type: string
+    Sample:
+      name: sample
+      in: query
+      required: false
+      description: |
+        When provided, the API scans the full range in ascending order and
+        returns an evenly sampled result set instead of paged raw history.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 2000
+
+  schemas:
+    TimestampInput:
+      oneOf:
+        - type: string
+          description: ISO-8601 timestamp with timezone, or a numeric epoch encoded as a string.
+          example: '2026-03-18T00:45:46.982324Z'
+        - type: number
+          description: Epoch timestamp in seconds, milliseconds, or microseconds.
+          example: 1742268346.982324
+
+    MsgIdInput:
+      oneOf:
+        - type: integer
+          example: 1742666412
+        - type: string
+          pattern: '^-?\d+$'
+          example: '1742666412'
+
+    WeatherFields:
+      type: object
+      description: |
+        Weather object accepted by ingest. Known fields are range-validated.
+        Unknown fields are currently preserved and stored as provided.
+      properties:
+        timestamp:
+          $ref: '#/components/schemas/TimestampInput'
+        wind_lull_ms:
+          type: number
+          minimum: 0
+          maximum: 150
+        wind_avg_ms:
+          type: number
+          minimum: 0
+          maximum: 150
+        wind_gust_ms:
+          type: number
+          minimum: 0
+          maximum: 200
+        wind_dir_deg:
+          type: number
+          minimum: 0
+          maximum: 360
+        wind_sample_interval_s:
+          type: number
+          minimum: 0
+          maximum: 3600
+        station_pressure_hpa:
+          type: number
+          minimum: 800
+          maximum: 1200
+        air_temp_c:
+          type: number
+          minimum: -100
+          maximum: 100
+        relative_humidity_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+        illuminance_lux:
+          type: number
+          minimum: 0
+          maximum: 500000
+        uv_index:
+          type: number
+          minimum: 0
+          maximum: 30
+        solar_radiation_wm2:
+          type: number
+          minimum: 0
+          maximum: 2000
+        rain_interval_mm:
+          type: number
+          minimum: 0
+          maximum: 1000
+        precipitation_type:
+          type: integer
+          enum:
+            - 0
+            - 1
+            - 2
+            - 3
+        lightning_avg_distance_km:
+          type: number
+          minimum: 0
+          maximum: 1000
+        lightning_strike_count:
+          type: number
+          minimum: 0
+          maximum: 1000000
+        battery_voltage_v:
+          type: number
+          minimum: 0
+          maximum: 20
+        report_interval_min:
+          type: number
+          minimum: 0
+          maximum: 1440
+        local_day_rain_mm:
+          type: number
+          minimum: 0
+          maximum: 5000
+        nearcast_rain_mm:
+          type: number
+          minimum: 0
+          maximum: 5000
+        local_day_nearcast_rain_mm:
+          type: number
+          minimum: 0
+          maximum: 5000
+        precipitation_analysis_type:
+          type: integer
+          enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            - 4
+      additionalProperties: true
+
+    ObservationPayload:
+      type: object
+      required:
+        - source_node_id
+        - msg_id
+        - source_ts_utc
+        - received_at_utc
+        - weather
+      properties:
+        source_node_id:
+          type: string
+          example: garden-node-01
+        source_name:
+          type: string
+          example: garden-node
+        msg_id:
+          $ref: '#/components/schemas/MsgIdInput'
+        source_ts_utc:
+          $ref: '#/components/schemas/TimestampInput'
+        received_at_utc:
+          $ref: '#/components/schemas/TimestampInput'
+        weather:
+          $ref: '#/components/schemas/WeatherFields'
+      additionalProperties: true
+
+    IngestObservationRequest:
+      type: object
+      required:
+        - payload
+      properties:
+        payload:
+          $ref: '#/components/schemas/ObservationPayload'
+
+    IngestResponse:
+      type: object
+      required:
+        - ok
+        - deduped
+        - source_node_id
+        - msg_id
+        - source_ts_utc
+        - observation_sk
+      properties:
+        ok:
+          type: boolean
+          enum:
+            - true
+        deduped:
+          type: boolean
+        source_node_id:
+          type: string
+        msg_id:
+          type: integer
+        source_ts_utc:
+          type: string
+          example: '2026-03-18T00:45:46.982324Z'
+        observation_sk:
+          type: string
+          example: 'OBS#2026-03-18T00:45:46.982324Z#WEATHER'
+
+    ErrorResponse:
+      type: object
+      required:
+        - ok
+        - error
+      properties:
+        ok:
+          type: boolean
+          enum:
+            - false
+        error:
+          type: string
+
+    ValidationErrorResponse:
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          required:
+            - details
+          properties:
+            error:
+              type: string
+              enum:
+                - validation_failed
+            details:
+              type: array
+              items:
+                type: string
+
+    LatestItem:
+      type: object
+      required:
+        - pk
+        - sk
+        - record_type
+        - observation_type
+        - source_node_id
+        - msg_id
+        - source_ts_utc
+        - source_ts_sort_utc
+        - received_at_utc
+        - weather
+        - latest_observation_sk
+        - updated_at_utc
+      properties:
+        pk:
+          type: string
+          example: STATION#garden-node-01
+        sk:
+          type: string
+          example: LATEST
+        record_type:
+          type: string
+          enum:
+            - latest
+        observation_type:
+          type: string
+          enum:
+            - WEATHER
+        source_node_id:
+          type: string
+        source_name:
+          type: string
+        msg_id:
+          type: integer
+        source_ts_utc:
+          type: string
+        source_ts_raw:
+          oneOf:
+            - type: string
+            - type: number
+        source_ts_sort_utc:
+          type: string
+        received_at_utc:
+          type: string
+        weather:
+          $ref: '#/components/schemas/WeatherFields'
+        latest_observation_sk:
+          type: string
+        updated_at_utc:
+          type: string
+      additionalProperties: true
+
+    HistoryObservationItem:
+      type: object
+      required:
+        - pk
+        - sk
+        - record_type
+        - observation_type
+        - source_node_id
+        - msg_id
+        - source_ts_utc
+        - source_ts_sort_utc
+        - received_at_utc
+        - weather
+        - ingested_at_utc
+      properties:
+        pk:
+          type: string
+        sk:
+          type: string
+        record_type:
+          type: string
+          enum:
+            - observation
+        observation_type:
+          type: string
+          enum:
+            - WEATHER
+        source_node_id:
+          type: string
+        source_name:
+          type: string
+        msg_id:
+          type: integer
+        source_ts_utc:
+          type: string
+        source_ts_raw:
+          oneOf:
+            - type: string
+            - type: number
+        source_ts_sort_utc:
+          type: string
+        received_at_utc:
+          type: string
+        weather:
+          $ref: '#/components/schemas/WeatherFields'
+        raw_payload:
+          type: object
+          additionalProperties: true
+        ingested_at_utc:
+          type: string
+      additionalProperties: true
+
+    SampledObservationItem:
+      type: object
+      required:
+        - pk
+        - sk
+        - record_type
+        - source_node_id
+        - msg_id
+        - source_ts_utc
+        - received_at_utc
+        - weather
+      properties:
+        pk:
+          type: string
+        sk:
+          type: string
+        record_type:
+          type: string
+          enum:
+            - observation
+        source_node_id:
+          type: string
+        source_name:
+          type: string
+        msg_id:
+          type: integer
+        source_ts_utc:
+          type: string
+        received_at_utc:
+          type: string
+        weather:
+          $ref: '#/components/schemas/WeatherFields'
+      additionalProperties: true
+
+    LatestResponse:
+      type: object
+      required:
+        - ok
+        - item
+      properties:
+        ok:
+          type: boolean
+          enum:
+            - true
+        item:
+          $ref: '#/components/schemas/LatestItem'
+
+    RawHistoryResponse:
+      type: object
+      required:
+        - ok
+        - mode
+        - stationId
+        - from
+        - to
+        - order
+        - count
+        - items
+      properties:
+        ok:
+          type: boolean
+          enum:
+            - true
+        mode:
+          type: string
+          enum:
+            - raw
+        stationId:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        order:
+          type: string
+          enum:
+            - asc
+            - desc
+        count:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/HistoryObservationItem'
+        nextToken:
+          type: string
+
+    SampledHistoryResponse:
+      type: object
+      required:
+        - ok
+        - mode
+        - stationId
+        - from
+        - to
+        - sampleRequested
+        - totalMatched
+        - count
+        - items
+      properties:
+        ok:
+          type: boolean
+          enum:
+            - true
+        mode:
+          type: string
+          enum:
+            - sampled
+        stationId:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        sampleRequested:
+          type: integer
+        totalMatched:
+          type: integer
+        count:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SampledObservationItem'

@@ -214,7 +214,9 @@ The parser converts raw JSON text into a structured `ParsedEvent`.
 
 ### Weather payload contract
 
-The parser recognizes weather when the JSON object contains all of these keys:
+The checked-in garden bridge currently emits weather observations as compact JSON with `et="obs_st"` plus the compact weather fields described below.
+
+The production parser described here recognizes weather when the JSON object contains all of these keys:
 
 - `i` = message id
 - `t` = temperature
@@ -227,6 +229,8 @@ The parser recognizes weather when the JSON object contains all of these keys:
 Optional:
 
 - `ts` = source timestamp
+- `et` = event type marker from the current garden bridge
+- additional optional weather/detail fields such as `g`, `l`, `uv`, `sr`, `lux`, `bat`, `ld`, `lc`, `pt`, `ri`, `rd`, `nr`, `nrd`, and `pa`
 
 The parser normalizes that compact payload into:
 
@@ -254,6 +258,8 @@ A payload with the right weather shape but invalid values becomes `packet_type="
 
 ### Health payload contract
 
+The current bridge heartbeat uses `sys = "dbg"` and includes uptime, IP, and diagnostic counters.
+
 The parser recognizes health packets when the JSON object contains `sys`.
 
 It normalizes fields such as:
@@ -269,6 +275,7 @@ It normalizes fields such as:
 
 - `invalid` means the payload could not be parsed or was structurally broken
 - `unknown` means the payload was valid JSON but did not match known weather or health schemas
+- the current garden bridge also emits `evt_precip`, `evt_strike`, `device_status`, and `hub_status` payloads; those payloads are part of the transport contract even though the fuller production parser/storage implementation is not checked into this repository
 
 ## 3.3 `storage.py`
 
@@ -485,16 +492,29 @@ The `.env` file is read from:
 
 ### Request body construction
 
-For each pending weather row, `build_api_request_body()` sends:
+For each pending weather row, `build_api_request_body()` sends a JSON body shaped like:
 
-- `source_node_id`
-- `source_name`
-- `msg_id`
-- `source_ts_utc`
-- `received_at_utc`
-- `weather`
+```json
+{
+  "payload": {
+    "source_node_id": "...",
+    "source_name": "...",
+    "msg_id": 17,
+    "source_ts_utc": "...",
+    "received_at_utc": "...",
+    "weather": {
+      "air_temp_c": 22.5,
+      "relative_humidity_pct": 52,
+      "station_pressure_hpa": 1011.4,
+      "wind_avg_ms": 3.4,
+      "wind_dir_deg": 230,
+      "rain_interval_mm": 0.0
+    }
+  }
+}
+```
 
-The `weather` object is built from the local row. The current local schema only guarantees the compact weather fields, but the builder is already prepared to include richer optional fields when they exist in the row.
+The worker sends `API_KEY` in the `x-weatherstation-key` header. Within `weather`, the cloud schema uses expanded field names such as `air_temp_c`, `relative_humidity_pct`, `station_pressure_hpa`, `wind_avg_ms`, `wind_gust_ms`, `wind_lull_ms`, `wind_dir_deg`, and `rain_interval_mm`.
 
 ### `msg_id` versus `source_ts_utc`
 
@@ -947,17 +967,27 @@ queue_worker fetches pending row
 
 # 7. Garden-side sender behavior relevant to the home/cloud pipeline
 
-Although the home server is the main focus of this document, two garden-side behaviors are important for understanding the data model.
+Although the home server is the main focus of this document, several garden-side behaviors are important for understanding the data model.
 
-## 7.1 `gardenNode/main.py` rate-limits weather forwarding
+## 7.1 `gardenNode/main.py` forwarded payloads and pacing
 
-The controller defines:
+The checked-in garden bridge supports these forwarded payload types:
 
-```text
-MIN_FORWARD_INTERVAL_SEC = 60
-```
+- `obs_st`
+- `evt_precip`
+- `evt_strike`
+- `device_status`
+- `hub_status`
 
-So the sender only forwards one weather observation per minute even if upstream UDP packets arrive more frequently.
+The controller applies these per-type forward intervals:
+
+- `obs_st`: 60 seconds
+- `evt_precip`: 60 seconds
+- `evt_strike`: 30 seconds
+- `device_status`: 60 seconds
+- `hub_status`: 60 seconds
+
+It also enforces a global minimum 5-second gap between UART sends and uses a small priority queue that replaces the latest queued `obs_st`, `device_status`, and `hub_status` snapshot instead of stacking stale copies.
 
 This explains why the sender’s own debug counter or upstream packet cadence can drift from cloud observation counts.
 
@@ -1293,27 +1323,26 @@ Required query parameters:
 Optional:
 
 - `limit` with default `200` and maximum `1000`
+- `order=asc` or `order=desc`, with `desc` as the default
+- `nextToken` for raw pagination
+- `sample` with minimum `1` and maximum `2000`
 
 ## 12.2 Time-range query behavior
 
-The read Lambda normalizes the `from` and `to` timestamps using the same normalization rules as ingest.
+The read Lambda does not normalize `from` and `to`. Callers must send timestamps that already match the sortable UTC form used in the stored sort keys, for example `2026-03-18T00:45:46.982324Z`.
 
 It then queries the partition using a sort key range like:
 
 ```text
-from: OBS#<normalized_from>#
-to:   OBS#<normalized_to>~
+from: OBS#<from>
+to:   OBS#<to>~
 ```
 
 The trailing `~` is a lexical upper-bound trick that ensures all matching observation keys in the time range are included.
 
-The query uses:
+In raw mode, the query uses `ScanIndexForward = False` by default and flips to ascending order only when `order=asc`.
 
-```text
-ScanIndexForward = False
-```
-
-so results come back newest first.
+When `sample` is provided, the Lambda scans the full matching window in ascending order, projects only the fields needed for sampling, caps the scan at 50,000 matched items, and returns an evenly sampled subset instead of paginated raw results.
 
 ## 12.3 Response structure
 
@@ -1326,12 +1355,36 @@ so results come back newest first.
 }
 ```
 
-### History response
+### Raw history response
 
 ```json
 {
   "ok": true,
+  "mode": "raw",
+  "stationId": "!5c32d4d9",
+  "from": "2026-03-18T00:00:00.000000Z",
+  "to": "2026-03-18T23:59:59.999999Z",
+  "order": "desc",
   "count": 123,
+  "items": [ ... ],
+  "nextToken": "..."
+}
+```
+
+`nextToken` is present only when more raw results are available.
+
+### Sampled history response
+
+```json
+{
+  "ok": true,
+  "mode": "sampled",
+  "stationId": "!5c32d4d9",
+  "from": "2026-03-18T00:00:00.000000Z",
+  "to": "2026-03-18T23:59:59.999999Z",
+  "sampleRequested": 200,
+  "totalMatched": 1234,
+  "count": 200,
   "items": [ ... ]
 }
 ```
