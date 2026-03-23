@@ -1,388 +1,192 @@
-# **Home Raspberry Pi 5 Server Design Specification**
+# Home Raspberry Pi 5 Server Design Specification
 
-*Meshtastic Serial Ingest | Python Service | SQLite Persistence | AWS API Delivery*
+*Meshtastic Serial Ingest | SQLite Persistence | AWS API Delivery*
 
-**Project: Weather Station**  
-Purpose: Build-ready specification for implementation on the home Raspberry Pi
+This document is an implementation-aligned overview of the checked-in home-server code in [`homeServer/`](../../homeServer). For the exhaustive schema and full end-to-end cloud model, use [`weather_station_mvp_architecture_and_schema.md`](./weather_station_mvp_architecture_and_schema.md).
 
-| Primary role | Receive weather packets from the home Meshtastic node over USB serial, store them locally, and relay weather observations to AWS. |
-| :---- | :---- |
-| **Host platform** | Raspberry Pi 5 running a long-lived Python service under systemd. |
-| **Local storage** | SQLite database used as the source of truth and retry queue. |
-| **Cloud target** | AWS HTTPS API endpoint, posted with at-least-once delivery semantics. |
-| **Operational model** | Local ingest must continue even when AWS is unavailable; heartbeat and status packets are advisory, not gating. |
+# 1. Purpose and Scope
 
-# **1\. Purpose and Scope**
+The home Raspberry Pi is the durable ingest point between the local Meshtastic mesh and AWS. It accepts text payloads from the USB-connected home node, stores accepted data locally in SQLite, and forwards weather observations to the AWS ingest API with at-least-once delivery semantics.
 
-**Purpose:** The home Raspberry Pi 5 server is the trusted software boundary between the local Meshtastic mesh and the cloud backend. It ingests weather and operational telemetry packets from the USB-connected home node, validates and stores them in SQLite, and posts normalized weather records to AWS.
+In scope in the current code:
 
-**In scope:** USB serial connection to the home Meshtastic node, Python ingest service, SQLite persistence, health/state tracking, AWS API delivery, retry queue, structured logging, systemd deployment, and unattended restart/recovery behavior.
+- Meshtastic serial ingest from the home node
+- packet parsing and validation
+- SQLite persistence
+- local event, telemetry, and ingest-diagnostics history
+- durable AWS weather-delivery queue
+- structured JSON logging
+- long-running deployment under systemd or equivalent service supervision
 
-**Out of scope for v1:** Home Assistant integration, local dashboard UI, MQTT-first architecture, multi-garden-node orchestration, bidirectional commands back to the mesh, and non-SQLite database engines.
+Out of scope in the current code:
 
-# **2\. High-Level Architecture**
+- Home Assistant integration
+- local dashboard UI
+- bidirectional commands back into the mesh
+- automatic `derived_state` computation
+- cloud delivery of health, event, or telemetry packets
 
-**Message path:** Garden weather source -> Garden Pico W -> Garden RAK node -> LoRa mesh -> Home RAK node -> USB serial -> Raspberry Pi 5 Python service -> SQLite -> AWS API.
+# 2. Runtime Architecture
 
-**Design principle:** The Pi is the first software system that should perform normalization, deduplication, queueing, cloud retries, and health/state derivation. The radio link should stay simple.
+The checked-in implementation is two cooperating long-lived processes, not one threaded process:
 
-# **3\. Core Design Decisions**
+- [`homeServer/listen_meshtastic.py`](../../homeServer/listen_meshtastic.py): serial ingest, parsing, and SQLite writes
+- [`homeServer/queue_worker.py`](../../homeServer/queue_worker.py): AWS delivery worker for queued weather rows
 
-**Chosen approach:** Use direct USB serial from the home node to the Pi, a single Python service for ingest and delivery, SQLite as the local durable queue/store, and at-least-once delivery to AWS.
+High-level data path:
 
-**Operational rule:** Accepted readings must be committed to SQLite before they are considered eligible for cloud delivery. Cloud failure must never drop a locally accepted reading.
-
-**Telemetry rule:** Heartbeat and status packets are advisory telemetry. Missing or bad telemetry should degrade operational state, but should not block valid weather ingestion.
-
-# **4\. Component Breakdown**
-
-| Component | Responsibility | Notes |
-| :---- | :---- | :---- |
-| Meshtastic serial adapter | Connect to the home node over USB serial and subscribe to inbound packets. | Own reconnect behavior when the radio disappears or re-enumerates. |
-| Packet parser / classifier | Classify packets as weather, heartbeat/debug, event/status, or unknown; validate and normalize fields. | Reject malformed or out-of-range payloads. |
-| SQLite storage layer | Persist accepted records, dedupe by `source_node_id` and `source_ts_utc`, and manage queue state. | Source of truth for both weather and delivery state. |
-| AWS delivery worker | POST normalized weather observations to AWS. | Must retry with backoff without losing locally committed data. |
-| State evaluator | Compute healthy, degraded, offline, or reserved future bridge-error states for each source node. | Uses freshness thresholds from both weather and heartbeat packets. |
-| Logging and operations | Write structured logs, expose startup/reconnect events, and support `journalctl` debugging. | Designed for unattended operation under systemd. |
-
-# **5\. Runtime Model**
-
-* One long-lived Python service process should run under systemd.  
-* The main thread should own Meshtastic ingest, validation, and SQLite writes.  
-* A background worker thread should own AWS upload retries so cloud latency cannot block ingest.  
-* The service should survive Pi reboot, USB re-enumeration, temporary Meshtastic disconnects, and temporary AWS outages.
-
-# **6\. Inbound Packet Contracts**
-
-The checked-in garden bridge emits compact newline-delimited JSON over Meshtastic text messages. The Pi service should recognize these payload families:
-
-* weather observations with `et="obs_st"`  
-* weather event snapshots with `et="evt_precip"` and `et="evt_strike"`  
-* device and hub snapshots with `et="device_status"` and `et="hub_status"`  
-* bridge heartbeat/debug telemetry with `sys="dbg"`
-
-## **6.1 Weather Observation Packet**
-
-```json
-{"et":"obs_st","i":17,"ts":1741985112,"t":22.5,"h":52,"p":1011.4,"w":3.4,"g":5.2,"l":1.1,"d":230,"r":0.0,"uv":2.4,"sr":410.0,"lux":12500,"bat":2.48,"ld":0.0,"lc":0,"pt":0,"ri":1,"rd":0.0,"nr":0.0,"nrd":0.0,"pa":0}
+```text
+garden weather source
+  -> garden Pico bridge
+  -> Meshtastic text message
+  -> home Meshtastic node over USB serial
+  -> homeServer/listen_meshtastic.py
+  -> homeServer/parser.py
+  -> homeServer/storage.py
+  -> SQLite
+  -> homeServer/queue_worker.py
+  -> AWS POST /observations
 ```
 
-| Field set | Meaning |
-| :---- | :---- |
-| `et` | Literal `obs_st` |
-| `i` | Sender-side message id generated by the garden bridge |
-| `ts` | Source observation timestamp in epoch seconds |
-| `t`, `h`, `p`, `w`, `g`, `l`, `d`, `r` | Temperature, humidity, pressure, average wind, gust, lull, direction, and interval rain |
-| `uv`, `sr`, `lux`, `bat` | UV index, solar radiation, illuminance, and battery voltage |
-| `ld`, `lc`, `pt`, `ri`, `rd`, `nr`, `nrd`, `pa` | Lightning and precipitation detail carried through from the current `obs_st` payload |
+Supporting files:
 
-The Pico bridge range-checks these values before forwarding. Packets that fail the sanity checks in `gardenNode/main.py` are not sent onward.
+- [`homeServer/db.py`](../../homeServer/db.py): SQLite connection helper
+- [`homeServer/schema.sql`](../../homeServer/schema.sql): schema definition
+- [`homeServer/util/test_ingest.py`](../../homeServer/util/test_ingest.py): simple local ingest smoke script
+- [`homeServer/util/show_latest.py`](../../homeServer/util/show_latest.py): quick SQLite inspection helper
+- [`util/home_server_listen_meshtastic.py`](../../util/home_server_listen_meshtastic.py): standalone Meshtastic logger/debug utility, not the production SQLite/AWS pipeline
 
-## **6.2 Other Forwarded Packets**
+# 3. Packet Classification
 
-The current garden bridge also forwards these compact payload shapes:
+The current listener only parses `TEXT_MESSAGE_APP` packets. Native Meshtastic `TELEMETRY_APP` packets are logged as `telemetry_packet_seen` but are not stored in SQLite.
 
-* `evt_precip`: `et`, `i`, `ts`  
-* `evt_strike`: `et`, `i`, `ts`, `ld`, `se`  
-* `device_status`: `et`, `i`, `ts`, `up`, `v`, `fw`, `r`, `hr`, `ss`, `dbg`  
-* `hub_status`: `et`, `i`, `ts`, `up`, `fw`, `r`, `rf`, `seq`, `fs`, `rs`, `ms`
+Text payload handling:
 
-## **6.3 Heartbeat / Debug Packet**
+| Payload shape | Parser result | Storage action | AWS delivery |
+| :---- | :---- | :---- | :---- |
+| `et="obs_st"` or legacy compact weather payload with required weather keys and `ts` | `weather` | insert `weather_readings`, enqueue `aws_delivery_queue`, update `device_status_current` | Yes |
+| `sys=...` heartbeat/debug packet | `health` | insert `device_health_events`, update `device_status_current` | No |
+| `et="evt_precip"` or `et="evt_strike"` | `weather_event` | insert `weather_events` | No |
+| `et="device_status"` or `et="hub_status"` | `telemetry` | insert `device_telemetry_events`, update `device_status_current` | No |
+| malformed JSON | `invalid` | insert `ingest_events` | No |
+| known schema with invalid values | `rejected` | insert `ingest_events` | No |
+| unknown JSON object | `unknown` | insert `ingest_events` | No |
 
-```json
-{"sys":"dbg","i":18,"up":900,"ip":"192.168.1.205","wc":1,"pm":0,"udp":54,"jerr":0,"unsup":0,"rej":0,"skip":12,"qsz":1,"qrepl":4,"qdrop":0,"fwd":22,"sockrec":0,"wifirec":0,"sockerr":0,"nwu":0,"last_udp_s":2,"last_obs_s":2,"last_ok_s":61}
+Important parser details:
+
+- accepted weather, weather-event, and telemetry packets require `ts`
+- health packets can omit `ts`
+- `source_ts_utc` is stored as the raw source timestamp text from the packet
+- weather uniqueness is `UNIQUE(source_node_id, source_ts_utc)` in SQLite
+
+# 4. Local Storage Model
+
+The database path is fixed in code:
+
+```text
+~/weatherstation-home/weatherstation/weatherstation.db
 ```
 
-This heartbeat is emitted every 15 minutes by the current bridge build. It is operational telemetry, not a weather observation.
+`db.py` opens SQLite with:
 
-## **6.4 Unknown Packet**
+- `PRAGMA foreign_keys=ON`
+- `PRAGMA journal_mode=WAL`
+- `sqlite3.Row` row objects
 
-If inbound text parses as JSON but does not match one of the supported weather, event, or heartbeat contracts, the service should log it as unknown, optionally store the raw payload for diagnostics, and continue running.
+The checked-in schema contains these tables:
 
-# **7\. Classification and Handling Rules**
+- `weather_readings`: canonical accepted weather history
+- `aws_delivery_queue`: durable backlog and retry state for AWS weather delivery
+- `device_health_events`: local history for `sys=...` heartbeat/debug packets
+- `weather_events`: local history for `evt_precip` and `evt_strike`
+- `device_telemetry_events`: local history for `device_status` and `hub_status`
+- `device_status_current`: one-row-per-device latest snapshot assembled from weather, health, and telemetry updates
+- `ingest_events`: diagnostics ledger for invalid, rejected, unknown, or duplicate packets
 
-| Condition | Classification | Action |
-| :---- | :---- | :---- |
-| `et="obs_st"` with valid weather fields | Weather | Validate, normalize, dedupe, persist, enqueue for AWS |
-| `et` is `evt_precip`, `evt_strike`, `device_status`, or `hub_status` | Event or status telemetry | Persist or log locally; do not send to `POST /observations` |
-| JSON contains `sys` | Heartbeat/debug telemetry | Persist or log locally; do not send to `POST /observations` |
-| Malformed JSON | Invalid | Log and discard |
-| Out-of-range values | Rejected | Log and discard |
-| Duplicate `source_node_id` + `source_ts_utc` | Duplicate | Ignore for primary weather history and optionally record in diagnostics |
+Current snapshot behavior:
 
-# **8\. Normalized Internal Data Model**
+- weather inserts update `last_weather_at_utc`
+- health inserts update `last_health_at_utc` and heartbeat fields
+- `device_status` inserts update device-side telemetry fields
+- `hub_status` inserts update hub-side telemetry fields
+- `derived_state` exists in schema but is not populated by the checked-in code
 
-The service should preserve the sender metadata and source timestamp, then map the compact garden payload into an explicit weather record before cloud delivery.
+# 5. AWS Delivery Behavior
 
-```json
-{
-  "source_node_id": "!abcd1234",
-  "source_name": "garden",
-  "msg_id": 17,
-  "source_ts_utc": "2026-03-15T22:31:52.000000Z",
-  "received_at_utc": "2026-03-15T22:31:58.982324Z",
-  "weather": {
-    "air_temp_c": 22.5,
-    "relative_humidity_pct": 52,
-    "station_pressure_hpa": 1011.4,
-    "wind_avg_ms": 3.4,
-    "wind_gust_ms": 5.2,
-    "wind_lull_ms": 1.1,
-    "wind_dir_deg": 230,
-    "rain_interval_mm": 0.0,
-    "uv_index": 2.4,
-    "solar_radiation_wm2": 410.0,
-    "illuminance_lux": 12500,
-    "battery_voltage_v": 2.48,
-    "lightning_avg_distance_km": 0.0,
-    "lightning_strike_count": 0,
-    "precipitation_type": 0,
-    "report_interval_min": 1,
-    "local_day_rain_mm": 0.0,
-    "nearcast_rain_mm": 0.0,
-    "local_day_nearcast_rain_mm": 0.0,
-    "precipitation_analysis_type": 0
-  },
-  "raw_payload": "{\"et\":\"obs_st\",...}"
-}
+Only rows from `weather_readings` are queued for cloud delivery.
+
+`queue_worker.py`:
+
+- polls `aws_delivery_queue` every 5 seconds
+- reads due rows with status `pending` or `retry`
+- builds a `POST /observations` body with expanded cloud field names
+- sends the shared secret in `x-weatherstation-key`
+- marks successful rows `delivered`
+- marks failed rows `retry` and schedules the next persistent attempt
+
+Configuration:
+
+- `API_URL` and `API_KEY` are loaded from the `.env` file one directory above `queue_worker.py`
+- in the deployed Pi layout that path is `~/weatherstation-home/.env`
+- `MESHTASTIC_DEVICE` is optional and used by `listen_meshtastic.py`
+
+Retry behavior:
+
+- in-process HTTP retry attempts: `5`
+- immediate retry delays: exponential from `2` seconds, capped at `30` seconds
+- persistent SQLite retry schedule after a failed queue cycle:
+  - first failure: `30` seconds
+  - second failure: `120` seconds
+  - third failure: `600` seconds
+  - fourth and later failures: `1800` seconds
+
+Current validation mismatch worth documenting:
+
+- the local parser accepts `precipitation_type` values `0` through `4`, while AWS ingest accepts only `0` through `3`
+- the local parser accepts `precipitation_analysis_type` values `0` through `10`, while AWS ingest accepts only `0` through `4`
+
+That means some rows can be accepted into local SQLite and later fail cloud delivery until the data or code changes.
+
+# 6. Deployment Notes
+
+The code assumes a deployed layout like:
+
+```text
+~/weatherstation-home/
+  .env
+  weatherstation/
+    listen_meshtastic.py
+    queue_worker.py
+    parser.py
+    storage.py
+    db.py
+    schema.sql
 ```
 
-# **9\. SQLite Schema**
+Initialize the database once before starting the services:
 
-SQLite is the local durable store and retry queue. All accepted weather messages must be written locally before attempting cloud delivery.
-
-## **9.1 weather\_readings**
-
-```sql
-CREATE TABLE weather_readings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_node_id TEXT NOT NULL,
-    source_name TEXT,
-    msg_id INTEGER NOT NULL,
-    source_ts_utc TEXT NOT NULL,
-    received_at_utc TEXT NOT NULL,
-    temp_c REAL NOT NULL,
-    humidity_pct REAL NOT NULL,
-    pressure_hpa REAL NOT NULL,
-    wind_ms REAL NOT NULL,
-    wind_dir_deg INTEGER NOT NULL,
-    rain_mm REAL NOT NULL,
-    raw_payload TEXT NOT NULL,
-    payload_hash TEXT,
-    created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(source_node_id, source_ts_utc)
-);
+```bash
+sqlite3 ~/weatherstation-home/weatherstation/weatherstation.db < ~/weatherstation-home/weatherstation/schema.sql
 ```
 
-## **9.2 aws\_delivery\_queue**
+Typical service model:
 
-```sql
-CREATE TABLE aws_delivery_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    reading_id INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at_utc TEXT,
-    last_attempt_at_utc TEXT,
-    delivered_at_utc TEXT,
-    last_error TEXT,
-    created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(reading_id) REFERENCES weather_readings(id) ON DELETE CASCADE,
-    UNIQUE(reading_id)
-);
-```
+- one systemd unit for `listen_meshtastic.py`
+- one systemd unit for `queue_worker.py`
 
-## **9.3 device\_health\_events**
-
-```sql
-CREATE TABLE device_health_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_node_id TEXT NOT NULL,
-    source_name TEXT,
-    msg_id INTEGER,
-    source_ts_utc TEXT,
-    received_at_utc TEXT NOT NULL,
-    status TEXT NOT NULL,
-    uptime_sec INTEGER,
-    ip_address TEXT,
-    error_reason TEXT,
-    raw_payload TEXT NOT NULL,
-    created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-## **9.4 device\_status\_current**
-
-```sql
-CREATE TABLE device_status_current (
-    source_node_id TEXT PRIMARY KEY,
-    source_name TEXT,
-    last_weather_at_utc TEXT,
-    last_health_at_utc TEXT,
-    last_status TEXT,
-    derived_state TEXT,
-    last_msg_id INTEGER,
-    last_source_ts_utc TEXT,
-    last_uptime_sec INTEGER,
-    last_ip_address TEXT,
-    updated_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-## **9.5 Recommended indexes**
-
-```sql
-CREATE INDEX idx_weather_received_at
-ON weather_readings(received_at_utc);
-
-CREATE INDEX idx_delivery_status_next_attempt
-ON aws_delivery_queue(status, next_attempt_at_utc, id);
-```
-
-# **10\. State and Health Evaluation**
-
-The service should derive an operational state from weather freshness and the bridge heartbeat cadence.
-
-| Derived state | Meaning | Recommended trigger |
-| :---- | :---- | :---- |
-| healthy | Weather is fresh and a recent heartbeat has been seen | Fresh weather plus recent `sys="dbg"` heartbeat |
-| degraded | Weather is still arriving but heartbeat telemetry is overdue | Heartbeat overdue but weather not stale |
-| offline | Weather updates are stale beyond the critical threshold | No weather for too long |
-| bad\_health | Reserved for future explicit bridge error states | A non-`dbg` `sys` value, if the bridge begins emitting one |
-
-## **Recommended thresholds:**
-
-* Heartbeat expected interval: every 15 minutes from the garden bridge  
-* health\_warning\_after\_sec: 30 minutes  
-* health\_critical\_after\_sec: 60 minutes  
-* weather\_warning\_after\_sec: 5 minutes  
-* weather\_critical\_after\_sec: 15 minutes
-
-## **State derivation order:**
-
-if last\_weather too old:  
-    state \= offline  
-elif last\_status is an explicit error state:  
-    state \= bad\_health  
-elif last\_health too old:  
-    state \= degraded  
-else:  
-    state \= healthy
-
-## **Operational rule:**
-
-Missing heartbeat/debug packets must not stop valid weather ingest. They affect state and alerting, not acceptance of legitimate weather readings.
-
-# **11\. Meshtastic Integration**
-
-* Use the home Meshtastic node connected by USB serial to the Raspberry Pi 5\.  
-* Open the radio with a serial Meshtastic client and subscribe to inbound receive events.  
-* Extract decoded text payloads and packet metadata such as source node id, node name, and receive time when available.  
-* Restrict ingestion to the expected source node if desired, but keep raw logging flexible during bring-up.  
-* On serial disconnect or re-enumeration, reconnect with backoff and resume ingest automatically.
-
-# **12\. AWS Delivery Design**
-
-## **12.1 Outbound AWS weather payload**
-
-```json
-{
-  "payload": {
-    "source_node_id": "!abcd1234",
-    "source_name": "garden",
-    "msg_id": 17,
-    "source_ts_utc": "2026-03-15T22:31:52.000000Z",
-    "received_at_utc": "2026-03-15T22:31:58.982324Z",
-    "weather": {
-      "air_temp_c": 22.5,
-      "relative_humidity_pct": 52,
-      "station_pressure_hpa": 1011.4,
-      "wind_avg_ms": 3.4,
-      "wind_gust_ms": 5.2,
-      "wind_lull_ms": 1.1,
-      "wind_dir_deg": 230,
-      "rain_interval_mm": 0.0
-    }
-  }
-}
-```
-
-## **12.2 Delivery semantics**
-
-* Use at-least-once delivery semantics.  
-* Successful cloud delivery should mark the queue row delivered; failed delivery should leave the row pending for retry.  
-* AWS dedupes weather history by `source_node_id` plus normalized `source_ts_utc`; `msg_id` is transport metadata only.
-
-## **12.3 Health/status delivery**
-
-* Persist every inbound heartbeat, event, and status packet locally.  
-* The checked-in AWS API only accepts weather observations on `POST /observations`.  
-* Do not post `evt_precip`, `evt_strike`, `device_status`, `hub_status`, or `sys="dbg"` packets to the weather ingest route.
-
-## **12.4 Authentication**
-
-For v1, send the shared secret in the `x-weatherstation-key` header. The secret must be injected through environment configuration, never hard-coded into source.
-
-# **13\. Reliability and Retry Behavior**
-
-| Failure case | Required behavior |
-| :---- | :---- |
-| Pi reboot | Service auto-starts under systemd, reopens SQLite, reconnects to the home node, and resumes pending AWS uploads. |
-| Home node USB disconnect | Log connection loss, retry serial connection with backoff, and resume ingest when the node reappears. |
-| AWS outage | Continue local ingest, keep queue rows pending, retry with exponential or stepped backoff. |
-| Duplicate weather packet | Ignore duplicate `source_node_id` + `source_ts_utc` after local dedupe. |
-| Malformed packet | Reject, log, and continue running without crashing the service. |
-
-# **14\. Security and Configuration**
-
-* Store configuration in an environment file such as `/etc/weatherstation-home.env`.  
-* Do not hard-code AWS URL, API credentials, or device path in source.  
-* Run the service under a dedicated Linux user, for example `weatherstation`.  
-* Use HTTPS only for cloud delivery.  
-* Apply least privilege on AWS-side roles and services.
-
-## **Recommended environment variables:**
-
-API\_URL=...  
-API\_KEY=...  
-MESHTASTIC\_DEVICE=/dev/ttyACM0  
-SQLITE\_PATH=/opt/weatherstation-home/data/weatherstation.db  
-LOG\_LEVEL=INFO
-
-# **15\. Logging and Operations**
-
-* Log to stdout/stderr so systemd captures entries in `journalctl`.  
-* Prefer structured one-line JSON logs for machine parsing and supportability.  
-* Emit lifecycle events: `service_start`, `meshtastic_connected`, `meshtastic_disconnected`, `reading_stored`, `aws_post_success`, `aws_post_failure`, `state_changed`.  
-* Log packet rejections with a reason but avoid dumping excessive repeated noise.
-
-## **Example log line:**
-
-```json
-{"event":"reading_stored","source_node_id":"!abcd1234","msg_id":17}
-```
-
-# **16\. Deployment on Raspberry Pi 5**
-
-* Use Raspberry Pi OS Lite or similar minimal Linux install.  
-* Install Python dependencies in a dedicated virtual environment.  
-* Deploy code under `/opt/weatherstation-home`.  
-* Use systemd for restart-on-failure and boot-time auto-start.
-
-## **Recommended systemd unit:**
+Example listener unit:
 
 ```ini
 [Unit]
-Description=Weather Station Home Ingest Service
+Description=Weather Station Meshtastic Listener
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=weatherstation
 WorkingDirectory=/opt/weatherstation-home
-EnvironmentFile=/etc/weatherstation-home.env
-ExecStart=/opt/weatherstation-home/.venv/bin/python /opt/weatherstation-home/app.py
+Environment=MESHTASTIC_DEVICE=/dev/ttyACM0
+ExecStart=/opt/weatherstation-home/.venv/bin/python /opt/weatherstation-home/weatherstation/listen_meshtastic.py
 Restart=always
 RestartSec=5
 
@@ -390,55 +194,66 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-# **17\. Suggested Python Module Layout**
+Example queue-worker unit:
 
-```text
-weatherstation_home/
-  app.py
-  config.py
-  meshtastic_client.py
-  parser.py
-  models.py
-  storage.py
-  aws_client.py
-  queue_worker.py
-  state_manager.py
-  logging_utils.py
-  schema.sql
+```ini
+[Unit]
+Description=Weather Station Queue Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=weatherstation
+WorkingDirectory=/opt/weatherstation-home
+Type=notify
+ExecStart=/opt/weatherstation-home/.venv/bin/python /opt/weatherstation-home/weatherstation/queue_worker.py
+Restart=always
+RestartSec=5
+WatchdogSec=30
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-* `app.py`: bootstrap service components and start threads  
-* `meshtastic_client.py`: serial connection and receive callbacks  
-* `parser.py`: classify, parse, and validate weather and telemetry packets  
-* `storage.py`: SQLite operations and transaction boundaries  
-* `aws_client.py`: outbound HTTPS posting  
-* `queue_worker.py`: retry queue loop and backoff policy  
-* `state_manager.py`: derive heartbeat/weather freshness state
+# 7. Observability and Validation
 
-# **18\. Implementation Phases**
+Both runtime scripts log structured one-line JSON to stdout.
 
-| Phase | Deliverable |
-| :---- | :---- |
-| Phase 1 | Serial connection to the home node and raw text packet logging |
-| Phase 2 | Weather packet parsing, validation, and SQLite inserts |
-| Phase 3 | Telemetry packet support and node-state derivation |
-| Phase 4 | AWS POST delivery and durable retry queue |
-| Phase 5 | systemd deployment, structured logs, and long-run soak testing |
+Representative listener events:
 
-# **19\. Acceptance Criteria**
+- `service_start`
+- `connecting`
+- `connected`
+- `packet_received`
+- `text_message_received`
+- `weather_saved`
+- `weather_duplicate`
+- `health_saved`
+- `weather_event_saved`
+- `telemetry_saved`
+- `packet_not_saved`
+- `connect_error`
+- `meshtastic_connected`
+- `meshtastic_disconnected`
 
-* Service auto-starts on Pi boot and reconnects to the USB-attached home node.  
-* Accepted weather messages are committed to SQLite before cloud delivery.  
-* Duplicate weather messages are ignored using `source_node_id` + `source_ts_utc`.  
-* Heartbeat and status packets are stored and reflected in derived node state.  
-* Missing heartbeat packets produce degraded state, not ingest failure.  
-* AWS failures do not lose locally accepted weather data and are retried later.  
-* Only weather observations are posted to the current AWS ingest API.
+Representative queue-worker events:
 
-# **20\. Final Operational Rules**
+- `queue_worker_start`
+- `delivery_attempt_started`
+- `delivery_retry_scheduled`
+- `delivery_retry_recovered`
+- `delivery_success`
+- `delivery_failure`
+- `queue_worker_error`
+- `queue_worker_stop`
 
-* Weather data is the primary business payload; heartbeat and status data are operational telemetry.  
-* No heartbeat does not mean no ingest. It means degraded confidence.  
-* An explicit bridge error state, if introduced later, should not block weather ingest.  
-* No fresh weather for too long means offline, regardless of the last heartbeat result.  
-* SQLite is the local system of record. AWS is a downstream consumer.
+Validation in this repository is still script-based rather than test-suite-based.
+
+# 8. Current Limitations
+
+The checked-in implementation intentionally does not do the following yet:
+
+- compute or persist a derived health state in `device_status_current.derived_state`
+- upload `sys`, `evt_precip`, `evt_strike`, `device_status`, or `hub_status` packets to AWS
+- ingest native Meshtastic `TELEMETRY_APP` packets into SQLite
+- provide an automated test suite

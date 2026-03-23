@@ -1,5 +1,11 @@
 # Weather Station MVP Architecture and Data Model
 
+## Project Links
+
+- Hackaday project page: https://hackaday.io/project/205363-meshtastic-weather-station
+- Live demo: https://www.brahmschultz.com/meshtastic-weather-station
+- Hosted Swagger API: https://agent215.github.io/weatherStationApiSwagger/
+
 ## Overview
 
 This document explains how the Weather Station MVP works end to end, with a focus on:
@@ -71,46 +77,55 @@ The system currently treats a weather observation as uniquely identified by:
 (source_node_id, source_ts_utc)
 ```
 
-That identity is used in both places:
+That identity is used in both places, but the normalization step happens only in AWS:
 
-- **SQLite**: `weather_readings` has `UNIQUE(source_node_id, source_ts_utc)`
-- **DynamoDB**: observation items are written with sort keys derived from `source_ts_utc`
+- **SQLite**: `weather_readings` stores the source timestamp text exactly as parsed and has `UNIQUE(source_node_id, source_ts_utc)`
+- **DynamoDB**: the ingest Lambda normalizes `source_ts_utc` to sortable UTC before building observation sort keys
 
-`msg_id` still matters, but it is now mainly transport/debug metadata rather than the canonical dedupe key for weather history.
+With the current garden bridge, `ts` is emitted consistently, so the raw home-side value and the normalized cloud value still behave as the same timestamp identity. `msg_id` still matters, but it is mainly transport/debug metadata rather than the canonical dedupe key for weather history.
 
 ---
 
 # 2. Codebase map
 
-This document describes the current production architecture. Not every production home-server module described below is currently checked into this repository.
+This document describes the current production architecture. The production home-server modules described below are checked into `homeServer/`.
 
 ## 2.1 Home-side files
 
-### `listen_meshtastic.py`
+### `homeServer/listen_meshtastic.py`
 Long-running listener process on the Raspberry Pi. It connects to the home Meshtastic node over USB serial, receives packets, and routes them into storage.
 
-In this repository, the checked-in Meshtastic-side utility is `home_server_listen_meshtastic.py`. The fuller production listener/storage pipeline described here is not fully present in the repo yet.
-
-### `parser.py`
+### `homeServer/parser.py`
 Parses the decoded text payload from Meshtastic and classifies it as:
 
 - weather
 - health
+- weather_event
+- telemetry
 - invalid
 - rejected
 - unknown
 
-### `storage.py`
+### `homeServer/storage.py`
 Implements all SQLite writes and queue state transitions.
 
-### `db.py`
+### `homeServer/db.py`
 Opens SQLite connections and applies database pragmas.
 
-### `schema.sql`
+### `homeServer/schema.sql`
 Defines the SQLite schema.
 
-### `queue_worker.py`
+### `homeServer/queue_worker.py`
 Polls pending rows from the local delivery queue and POSTs them to AWS.
+
+### `homeServer/util/test_ingest.py`
+Small local ingest smoke script for exercising parser/storage behavior.
+
+### `homeServer/util/show_latest.py`
+Simple SQLite inspection helper for recent weather, health, and queue rows.
+
+### `util/home_server_listen_meshtastic.py`
+Standalone Meshtastic USB logger/debug utility. It is useful during bring-up, but it is not the SQLite/AWS ingest pipeline.
 
 ## 2.2 Garden-side producer files
 
@@ -138,9 +153,9 @@ AWS read Lambda.
 
 # 3. Home server runtime behavior
 
-## 3.1 `listen_meshtastic.py`
+## 3.1 `homeServer/listen_meshtastic.py`
 
-This is the entry point for inbound Meshtastic traffic on the home server.
+This is the checked-in entry point for inbound Meshtastic traffic on the home server.
 
 ### What it does
 
@@ -148,7 +163,8 @@ This is the entry point for inbound Meshtastic traffic on the home server.
 - subscribes to pubsub topics for packet receive and connection state
 - extracts sender metadata from packets
 - decodes the text payload
-- passes the text into the parser
+- only parses `TEXT_MESSAGE_APP` packets; native `TELEMETRY_APP` packets are logged as `telemetry_packet_seen` but not stored in SQLite
+- passes text payloads into the parser
 - calls storage functions based on parser output
 - logs structured JSON events
 - reconnects automatically if the serial link drops
@@ -162,10 +178,6 @@ The listener extracts:
 
 This is the only place `source_name` is discovered. The cloud does not derive it on its own. If Meshtastic packet metadata does not include a name, `source_name` remains null through the rest of the pipeline.
 
-### How packets are handled
-
-The listener only treats `TEXT_MESSAGE_APP` packets as application payloads to parse. Other packet classes can still be logged, but weather and health ingestion happens through text packets.
-
 ### Weather path
 
 For a parsed weather event, the listener calls:
@@ -178,23 +190,43 @@ If `insert_weather` returns `"duplicate"`, the listener records an ingest event 
 
 ### Health path
 
-For a parsed health packet, the listener calls:
+For a parsed legacy heartbeat/debug packet, the listener calls:
 
 ```python
 insert_health(parsed)
 ```
 
+### Weather-event path
+
+For `evt_precip` and `evt_strike`, the listener calls:
+
+```python
+insert_weather_event(parsed)
+```
+
+These packets are stored locally only and are not queued for AWS weather delivery.
+
+### Telemetry path
+
+For `device_status` and `hub_status`, the listener calls:
+
+```python
+insert_device_telemetry(parsed)
+```
+
+These packets are also stored locally only.
+
 ### Invalid / rejected / unknown path
 
-Anything not accepted as weather or health is stored in `ingest_events` through:
+Anything not accepted as weather, health, weather event, or telemetry is stored in `ingest_events` through:
 
 ```python
 record_ingest_event(parsed)
 ```
 
-That makes malformed or unexpected packets visible for troubleshooting.
+That makes malformed, rejected, and unexpected packets visible for troubleshooting.
 
-## 3.2 `parser.py`
+## 3.2 `homeServer/parser.py`
 
 The parser converts raw JSON text into a structured `ParsedEvent`.
 
@@ -202,23 +234,27 @@ The parser converts raw JSON text into a structured `ParsedEvent`.
 
 | Field | Meaning |
 |---|---|
-| `packet_type` | Parser classification such as `weather`, `health`, `invalid`, `rejected`, or `unknown` |
+| `packet_type` | Parser classification such as `weather`, `health`, `weather_event`, `telemetry`, `invalid`, `rejected`, or `unknown` |
 | `reason` | Optional explanation when a packet is rejected or not recognized |
 | `source_node_id` | Meshtastic sender id |
 | `source_name` | Sender name if available |
 | `msg_id` | Message id extracted from the payload if available |
 | `received_at_utc` | When the home server received the packet |
-| `source_ts_utc` | Timestamp reported by the originating source payload |
+| `source_ts_utc` | Source timestamp text as carried by the payload |
 | `raw_payload` | Original text received from Meshtastic |
-| `normalized` | Parsed structured fields for weather or health packets |
+| `normalized` | Parsed structured fields for accepted weather, health, event, or telemetry packets |
 
 ### Weather payload contract
 
-The checked-in garden bridge currently emits weather observations as compact JSON with `et="obs_st"` plus the compact weather fields described below.
+The parser accepts weather from two shapes:
 
-The production parser described here recognizes weather when the JSON object contains all of these keys:
+- the current bridge payload with `et="obs_st"`
+- a legacy compact weather payload that omits `et` but still contains the required weather keys
+
+For a weather packet to be accepted, these fields must be present:
 
 - `i` = message id
+- `ts` = source timestamp
 - `t` = temperature
 - `h` = humidity
 - `p` = pressure
@@ -226,26 +262,32 @@ The production parser described here recognizes weather when the JSON object con
 - `d` = wind direction
 - `r` = rain
 
-Optional:
+Optional weather/detail fields include:
 
-- `ts` = source timestamp
-- `et` = event type marker from the current garden bridge
-- additional optional weather/detail fields such as `g`, `l`, `uv`, `sr`, `lux`, `bat`, `ld`, `lc`, `pt`, `ri`, `rd`, `nr`, `nrd`, and `pa`
+- `l` = wind lull
+- `g` = wind gust
+- `ws` = wind sample interval
+- `lux` = illuminance
+- `uv` = UV index
+- `sr` = solar radiation
+- `pt` = precipitation type
+- `ld` = lightning average distance
+- `lc` = lightning strike count
+- `bat` = battery voltage
+- `ri` = report interval minutes
+- `rd` = local day rain
+- `nr` = nearcast rain
+- `nrd` = local day nearcast rain
+- `pa` = precipitation analysis type
 
-The parser normalizes that compact payload into:
+The parser stores `ts` twice for weather:
 
-- `msg_id`
-- `temp_c`
-- `humidity_pct`
-- `pressure_hpa`
-- `wind_ms`
-- `wind_dir_deg`
-- `rain_mm`
-- `source_ts_utc`
+- as the raw string `source_ts_utc`
+- as numeric `weather_timestamp` when the value can be parsed as an integer
 
 ### Weather validation ranges
 
-The parser enforces these ranges before local storage:
+The parser enforces these local ranges before weather reaches SQLite:
 
 - temperature: `-60` to `70`
 - humidity: `0` to `100`
@@ -253,6 +295,21 @@ The parser enforces these ranges before local storage:
 - wind speed: `0` to `100`
 - wind direction: `0` to `360`
 - rain: `0` to `500`
+- wind lull: `0` to `100`
+- wind gust: `0` to `120`
+- wind sample interval: `0` to `120`
+- illuminance: `0` to `200000`
+- UV index: `0` to `30`
+- solar radiation: `0` to `2000`
+- precipitation type: `0` to `4`
+- lightning distance: `0` to `500`
+- lightning strike count: `0` to `10000`
+- battery voltage: `0` to `10`
+- report interval: `0` to `120`
+- local day rain: `0` to `2000`
+- nearcast rain: `0` to `2000`
+- local day nearcast rain: `0` to `2000`
+- precipitation analysis type: `0` to `10`
 
 A payload with the right weather shape but invalid values becomes `packet_type="rejected"`.
 
@@ -271,13 +328,43 @@ It normalizes fields such as:
 - `error_reason` from `err`
 - `source_ts_utc` from `ts`
 
-### Invalid and unknown classifications
+For health packets, `ts` is optional.
+
+### Weather-event payload contract
+
+The parser recognizes these weather-event payloads:
+
+- `evt_precip`
+- `evt_strike`
+
+Accepted weather-event packets must include `i`, `et`, and `ts`. `evt_strike` must also provide:
+
+- `ld` = lightning distance
+- `se` = lightning energy
+
+`evt_precip` becomes a locally stored event row with no extra weather fields. `evt_strike` also validates distance and energy ranges.
+
+### Telemetry payload contract
+
+The parser recognizes these telemetry payloads:
+
+- `device_status`
+- `hub_status`
+
+Accepted telemetry packets must include `i`, `et`, and `ts`. Type-specific optional fields include:
+
+- for `device_status`: `up`, `v`, `fw`, `r`, `hr`, `ss`, `dbg`
+- for `hub_status`: `up`, `fw`, `r`, `rf`, `seq`, `fs`, `rs`, `ms`
+
+The parser validates uptime, RSSI, voltage, sequence counters, and the expected list shape for `fs`, `rs`, and `ms`.
+
+### Invalid, rejected, and unknown classifications
 
 - `invalid` means the payload could not be parsed or was structurally broken
-- `unknown` means the payload was valid JSON but did not match known weather or health schemas
-- the current garden bridge also emits `evt_precip`, `evt_strike`, `device_status`, and `hub_status` payloads; those payloads are part of the transport contract even though the fuller production parser/storage implementation is not checked into this repository
+- `rejected` means the payload matched a known schema family but failed validation
+- `unknown` means the payload was valid JSON but did not match the supported weather, health, weather-event, or telemetry schemas
 
-## 3.3 `storage.py`
+## 3.3 `homeServer/storage.py`
 
 `storage.py` is the concrete storage layer for the home server. It owns all SQLite writes and queue state transitions.
 
@@ -394,6 +481,44 @@ This inserts a row into `device_health_events` and updates the current device sn
 
 Health packets therefore feed the operational state view of each device even though they are not pushed to AWS history.
 
+### `insert_weather_event(event)`
+
+This stores `evt_precip` and `evt_strike` packets in `weather_events`.
+
+Each stored row includes:
+
+- source metadata
+- message id
+- event type
+- source timestamp
+- receive time
+- optional lightning distance and energy
+- raw payload
+- SHA-256 payload hash
+
+Weather events are retained locally for diagnostics and event history only. They are not added to `aws_delivery_queue`.
+
+### `insert_device_telemetry(event)`
+
+This stores `device_status` and `hub_status` packets in `device_telemetry_events`.
+
+The insert keeps:
+
+- source metadata
+- message id
+- telemetry type
+- source timestamp
+- receive time
+- optional uptime, firmware revision, RSSI, voltage, and reset/sequence fields
+- compact JSON text for `fs`, `rs`, and `ms` when those list payloads are present
+- raw payload
+- SHA-256 payload hash
+
+It also upserts `device_status_current`:
+
+- `device_status` refreshes columns such as `last_device_status_at_utc`, `last_telemetry_type`, `last_firmware_revision`, `last_rssi`, `last_hub_rssi`, `last_sensor_status`, `last_debug`, and `last_device_voltage_v`
+- `hub_status` refreshes columns such as `last_hub_status_at_utc`, `last_telemetry_type`, `last_firmware_revision`, `last_rssi`, `last_reset_flags`, `last_hub_seq`, `last_fs_json`, `last_radio_stats_json`, and `last_mqtt_stats_json`
+
 ### `fetch_pending_deliveries(limit=10)`
 
 This is the queue worker’s read path into SQLite.
@@ -484,11 +609,10 @@ The worker expects:
 - `API_URL`
 - `API_KEY`
 
-The `.env` file is read from:
+The `.env` file is resolved as the directory above `queue_worker.py`:
 
-```text
-<project root>/.env
-```
+- deployed Pi layout: `~/weatherstation-home/.env`
+- when run in-place from this repository: `<repo root>/.env`
 
 ### Request body construction
 
@@ -500,8 +624,8 @@ For each pending weather row, `build_api_request_body()` sends a JSON body shape
     "source_node_id": "...",
     "source_name": "...",
     "msg_id": 17,
-    "source_ts_utc": "...",
-    "received_at_utc": "...",
+    "source_ts_utc": "1741985112",
+    "received_at_utc": "2026-03-18T00:45:46.982324Z",
     "weather": {
       "air_temp_c": 22.5,
       "relative_humidity_pct": 52,
@@ -521,7 +645,18 @@ The worker sends `API_KEY` in the `x-weatherstation-key` header. Within `weather
 The queue worker still sends both values:
 
 - `msg_id` remains useful for tracing and debugging
-- `source_ts_utc` is the important identity field for cloud history dedupe
+- `source_ts_utc` is forwarded exactly as stored in SQLite and is the important identity field for cloud history dedupe
+
+With the current bridge, `source_ts_utc` is typically an epoch-seconds string. The ingest Lambda normalizes it before writing DynamoDB.
+
+### Local versus cloud validation
+
+The home-side parser and the cloud ingest validator are not identical.
+
+- local parser accepts `precipitation_type` values `0` through `4`; AWS currently accepts only `0` through `3`
+- local parser accepts `precipitation_analysis_type` values `0` through `10`; AWS currently accepts only `0` through `4`
+
+Those values can therefore be accepted into SQLite and later fail cloud delivery, which leaves the queue row in retry state until the data or code changes.
 
 ### Immediate in-process retry behavior
 
@@ -642,6 +777,22 @@ CREATE TABLE IF NOT EXISTS weather_readings (
     wind_ms REAL NOT NULL,
     wind_dir_deg INTEGER NOT NULL,
     rain_mm REAL NOT NULL,
+    wind_lull_ms REAL,
+    wind_gust_ms REAL,
+    wind_sample_interval_s INTEGER,
+    illuminance_lux REAL,
+    uv_index REAL,
+    solar_radiation_wm2 REAL,
+    precipitation_type INTEGER,
+    lightning_avg_distance_km REAL,
+    lightning_strike_count INTEGER,
+    battery_voltage_v REAL,
+    report_interval_min INTEGER,
+    local_day_rain_mm REAL,
+    nearcast_rain_mm REAL,
+    local_day_nearcast_rain_mm REAL,
+    precipitation_analysis_type INTEGER,
+    weather_timestamp INTEGER,
     raw_payload TEXT NOT NULL,
     payload_hash TEXT,
     created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -649,52 +800,16 @@ CREATE TABLE IF NOT EXISTS weather_readings (
 );
 ```
 
-### Column-by-column explanation
+### Notes
 
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | Internal surrogate key for SQLite. Other tables, especially `aws_delivery_queue`, reference this value. |
-| `source_node_id` | `TEXT NOT NULL` | Meshtastic node id of the sender, such as `!5c32d4d9`. This is the station identity on the home side. |
-| `source_name` | `TEXT` | Human-readable node name from Meshtastic packet metadata when available. |
-| `msg_id` | `INTEGER NOT NULL` | Message id assigned on the sender side. Useful for debugging, ordering, and transport tracing. Not the canonical dedupe key for weather rows. |
-| `source_ts_utc` | `TEXT NOT NULL` | Timestamp from the source payload. This is the natural identity timestamp for a weather observation in the current design. |
-| `received_at_utc` | `TEXT NOT NULL` | When the home server received and processed the packet. |
-| `temp_c` | `REAL NOT NULL` | Temperature in Celsius. |
-| `humidity_pct` | `REAL NOT NULL` | Relative humidity percentage. |
-| `pressure_hpa` | `REAL NOT NULL` | Pressure in hectopascals. |
-| `wind_ms` | `REAL NOT NULL` | Wind speed in meters per second. In the current compact payload this is average wind speed. |
-| `wind_dir_deg` | `INTEGER NOT NULL` | Wind direction in degrees. |
-| `rain_mm` | `REAL NOT NULL` | Rain amount in millimeters for the reporting interval represented by the packet. |
-| `raw_payload` | `TEXT NOT NULL` | Original payload string exactly as received through Meshtastic. |
-| `payload_hash` | `TEXT` | SHA-256 hash of `raw_payload`. Useful for diagnostics and for verifying that two packets had identical bodies. |
-| `created_at_utc` | `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP` | When the row was inserted into SQLite. |
-
-### Uniqueness rule
-
-```sql
-UNIQUE(source_node_id, source_ts_utc)
-```
-
-This is the home-side weather dedupe rule. It means one source node can only have one stored weather reading for a given source timestamp.
-
-### Indexes
-
-```sql
-CREATE INDEX IF NOT EXISTS idx_weather_received_at
-ON weather_readings(received_at_utc);
-
-CREATE INDEX IF NOT EXISTS idx_weather_source_received
-ON weather_readings(source_node_id, received_at_utc);
-
-CREATE INDEX IF NOT EXISTS idx_weather_source_msg
-ON weather_readings(source_node_id, msg_id);
-```
-
-### What the indexes support
-
-- `idx_weather_received_at`: recent ingest inspection by local receive time
-- `idx_weather_source_received`: per-station history lookups
-- `idx_weather_source_msg`: packet tracing by source and sender-side message id
+- `UNIQUE(source_node_id, source_ts_utc)` is the home-side weather dedupe rule.
+- `source_ts_utc` is stored exactly as parsed from the sender payload.
+- The required core weather fields are `temp_c`, `humidity_pct`, `pressure_hpa`, `wind_ms`, `wind_dir_deg`, and `rain_mm`.
+- The remaining weather columns mirror the extended `obs_st` fields carried by the garden bridge.
+- Indexes:
+  - `idx_weather_received_at`
+  - `idx_weather_source_received`
+  - `idx_weather_source_msg`
 
 ## 5.2 `aws_delivery_queue`
 
@@ -805,7 +920,83 @@ ON device_health_events(source_node_id, received_at_utc);
 
 This supports health history queries by device and time.
 
-## 5.4 `device_status_current`
+## 5.4 `weather_events`
+
+### Purpose
+
+Stores locally retained `evt_precip` and `evt_strike` packets.
+
+### DDL
+
+```sql
+CREATE TABLE IF NOT EXISTS weather_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_node_id TEXT NOT NULL,
+    source_name TEXT,
+    msg_id INTEGER,
+    event_type TEXT NOT NULL,
+    source_ts_utc TEXT,
+    received_at_utc TEXT NOT NULL,
+    lightning_distance_km REAL,
+    lightning_energy INTEGER,
+    raw_payload TEXT NOT NULL,
+    payload_hash TEXT,
+    created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Notes
+
+- `event_type` is currently `evt_precip` or `evt_strike`.
+- `lightning_distance_km` and `lightning_energy` are populated for strike events when present.
+- Indexes:
+  - `idx_weather_events_source_received`
+  - `idx_weather_events_type_received`
+
+## 5.5 `device_telemetry_events`
+
+### Purpose
+
+Stores locally retained `device_status` and `hub_status` packets.
+
+### DDL
+
+```sql
+CREATE TABLE IF NOT EXISTS device_telemetry_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_node_id TEXT NOT NULL,
+    source_name TEXT,
+    msg_id INTEGER,
+    telemetry_type TEXT NOT NULL,
+    source_ts_utc TEXT,
+    received_at_utc TEXT NOT NULL,
+    uptime_sec INTEGER,
+    firmware_revision TEXT,
+    rssi INTEGER,
+    hub_rssi INTEGER,
+    sensor_status INTEGER,
+    debug INTEGER,
+    voltage REAL,
+    reset_flags TEXT,
+    seq INTEGER,
+    fs_json TEXT,
+    radio_stats_json TEXT,
+    mqtt_stats_json TEXT,
+    raw_payload TEXT NOT NULL,
+    payload_hash TEXT,
+    created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Notes
+
+- `telemetry_type` is currently `device_status` or `hub_status`.
+- `fs_json`, `radio_stats_json`, and `mqtt_stats_json` store compact JSON text for list-valued payloads.
+- Indexes:
+  - `idx_telemetry_source_received`
+  - `idx_telemetry_type_received`
+
+## 5.6 `device_status_current`
 
 ### Purpose
 
@@ -821,39 +1012,39 @@ CREATE TABLE IF NOT EXISTS device_status_current (
     source_name TEXT,
     last_weather_at_utc TEXT,
     last_health_at_utc TEXT,
+    last_device_status_at_utc TEXT,
+    last_hub_status_at_utc TEXT,
     last_status TEXT,
     derived_state TEXT,
+    last_telemetry_type TEXT,
     last_msg_id INTEGER,
     last_source_ts_utc TEXT,
     last_uptime_sec INTEGER,
     last_ip_address TEXT,
+    last_firmware_revision TEXT,
+    last_rssi INTEGER,
+    last_hub_rssi INTEGER,
+    last_sensor_status INTEGER,
+    last_debug INTEGER,
+    last_device_voltage_v REAL,
+    last_reset_flags TEXT,
+    last_hub_seq INTEGER,
+    last_fs_json TEXT,
+    last_radio_stats_json TEXT,
+    last_mqtt_stats_json TEXT,
     updated_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
-### Column-by-column explanation
+### Notes
 
-| Column | Type | Meaning |
-|---|---|---|
-| `source_node_id` | `TEXT PRIMARY KEY` | One row per source node. |
-| `source_name` | `TEXT` | Latest known human-readable node name. |
-| `last_weather_at_utc` | `TEXT` | Home-server receive time of the most recent accepted weather packet from this device. |
-| `last_health_at_utc` | `TEXT` | Home-server receive time of the most recent health packet from this device. |
-| `last_status` | `TEXT` | Most recent health status string, such as `dbg`. |
-| `derived_state` | `TEXT` | Reserved field for higher-level state derivation. The current `storage.py` does not actively populate it. |
-| `last_msg_id` | `INTEGER` | Most recent message id seen for this device, whether from a weather or health update path. |
-| `last_source_ts_utc` | `TEXT` | Most recent source-side timestamp seen from this device. |
-| `last_uptime_sec` | `INTEGER` | Last reported uptime from a health packet. |
-| `last_ip_address` | `TEXT` | Last reported IP address from a health packet. |
-| `updated_at_utc` | `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP` | When this snapshot row was last refreshed. |
+- Weather inserts update `last_weather_at_utc`, `last_msg_id`, and `last_source_ts_utc`.
+- Health inserts update `last_health_at_utc`, `last_status`, `last_uptime_sec`, and `last_ip_address`.
+- `device_status` telemetry updates the device-specific latest columns.
+- `hub_status` telemetry updates the hub-specific latest columns.
+- `derived_state` is reserved in schema but is not populated by the checked-in code.
 
-### How it is maintained
-
-- weather inserts update the weather-related columns
-- health inserts update the health-related columns
-- the row is upserted with `ON CONFLICT(source_node_id)`
-
-## 5.5 `ingest_events`
+## 5.7 `ingest_events`
 
 ### Purpose
 
@@ -935,7 +1126,24 @@ Meshtastic text packet
   -> storage updates device_status_current
 ```
 
-## 6.4 Invalid or unknown packet
+## 6.4 Weather-event packet
+
+```text
+Meshtastic text packet
+  -> parser classifies as weather_event
+  -> storage inserts weather_events row
+```
+
+## 6.5 Device telemetry packet
+
+```text
+Meshtastic text packet
+  -> parser classifies as telemetry
+  -> storage inserts device_telemetry_events row
+  -> storage updates device_status_current
+```
+
+## 6.6 Invalid, rejected, or unknown packet
 
 ```text
 Meshtastic text packet
@@ -943,7 +1151,7 @@ Meshtastic text packet
   -> storage records one ingest_events row
 ```
 
-## 6.5 Successful AWS delivery
+## 6.7 Successful AWS delivery
 
 ```text
 queue_worker fetches pending row
@@ -953,7 +1161,7 @@ queue_worker fetches pending row
   -> row becomes delivered
 ```
 
-## 6.6 Failed AWS delivery
+## 6.8 Failed AWS delivery
 
 ```text
 queue_worker fetches pending row
@@ -1230,7 +1438,7 @@ The Lambda validates:
 
 It also validates recognized weather fields against numeric range rules.
 
-The cloud schema is richer than the local parser. The ingest Lambda can validate additional optional weather fields such as:
+The ingest Lambda validates the same expanded weather fields that the current queue worker can send, including:
 
 - `wind_lull_ms`
 - `wind_gust_ms`
@@ -1401,6 +1609,8 @@ SQLite is responsible for:
 - deduping local weather observations
 - tracking delivery attempts to AWS
 - storing health/debug history
+- storing locally retained weather-event history
+- storing locally retained device/hub telemetry history
 - recording parse failures and unexpected payloads
 
 It is the home server’s authoritative event journal and backlog.
@@ -1489,7 +1699,13 @@ Canonical local weather history.
 Persistent backlog and retry state for AWS delivery.
 
 ### `device_health_events`
-Local history of health/debug/status packets.
+Local history of legacy `sys=...` heartbeat/debug packets.
+
+### `weather_events`
+Local history of `evt_precip` and `evt_strike` packets.
+
+### `device_telemetry_events`
+Local history of `device_status` and `hub_status` packets.
 
 ### `device_status_current`
 One-row-per-device latest state snapshot.

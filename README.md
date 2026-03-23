@@ -1,17 +1,18 @@
 # Weather Station Scripts
 
-This repository contains the current weather-station MVP documentation plus the code artifacts that support the garden bridge, Meshtastic ingest, AWS APIs, and local test tooling.
+This repository contains the current weather-station MVP documentation plus the code artifacts that support the garden bridge, the full home-server ingest pipeline, the AWS APIs, and local test tooling.
 
 The production system is a store-and-forward pipeline:
 
 `weather source -> garden bridge -> Meshtastic -> home Raspberry Pi -> SQLite backlog -> AWS ingest API -> DynamoDB -> read APIs`
 
-The primary production reference is [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md). That document describes the current home-server schema, queueing model, AWS stack, and DynamoDB data model. The checked-in code in this repository covers the garden bridge, a Meshtastic listener utility, the AWS Lambda handlers, and mocks used for bench testing.
+The primary production reference is [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md). That document describes the current home-server schema, queueing model, AWS stack, and DynamoDB data model. The checked-in code in this repository now includes the garden bridge, the full `homeServer/` listener/parser/storage/queue-worker pipeline, the standalone Meshtastic listener utility, the AWS Lambda handlers, and mocks/test utilities.
 
 ## Project Links
 
 - Hackaday project page: https://hackaday.io/project/205363-meshtastic-weather-station
 - Live demo: https://www.brahmschultz.com/meshtastic-weather-station
+- Hosted Swagger API: https://agent215.github.io/weatherStationApiSwagger/
 
 ## Production Overview
 
@@ -23,7 +24,15 @@ The primary production reference is [`documentation/markdown/weather_station_mvp
 ## Repository Layout
 
 - [`gardenNode/main.py`](./gardenNode/main.py): MicroPython garden bridge for the Raspberry Pi Pico W
-- [`util/home_server_listen_meshtastic.py`](./util/home_server_listen_meshtastic.py): home-side Meshtastic USB listener/logger utility
+- [`homeServer/listen_meshtastic.py`](./homeServer/listen_meshtastic.py): production home-side Meshtastic ingest process
+- [`homeServer/parser.py`](./homeServer/parser.py): parser/classifier for weather, health, event, telemetry, invalid, rejected, and unknown packets
+- [`homeServer/storage.py`](./homeServer/storage.py): SQLite write path and AWS queue state transitions
+- [`homeServer/db.py`](./homeServer/db.py): SQLite connection helper and database path definition
+- [`homeServer/schema.sql`](./homeServer/schema.sql): production home-side SQLite schema
+- [`homeServer/queue_worker.py`](./homeServer/queue_worker.py): production AWS delivery worker
+- [`homeServer/util/test_ingest.py`](./homeServer/util/test_ingest.py): simple local ingest smoke script
+- [`homeServer/util/show_latest.py`](./homeServer/util/show_latest.py): quick SQLite inspection helper
+- [`util/home_server_listen_meshtastic.py`](./util/home_server_listen_meshtastic.py): standalone Meshtastic USB listener/logger utility
 - [`util/tempest_udp_listener_test_script.py`](./util/tempest_udp_listener_test_script.py): UDP listener/validator for supported Tempest packet types
 - [`aws/ingest/app.py`](./aws/ingest/app.py): ingest Lambda for `POST /observations`
 - [`aws/read/app.py`](./aws/read/app.py): read Lambda for `GET /observations` and `GET /observations/latest`
@@ -136,9 +145,11 @@ Additional hardware notes that matter in practice:
 
 ## Home Side And AWS
 
-[`util/home_server_listen_meshtastic.py`](./util/home_server_listen_meshtastic.py) is the checked-in home-side listener utility. It connects to a Meshtastic node over USB serial, emits structured JSON logs for packet/text/connection events, and automatically reconnects if the serial link drops. It uses the `MESHTASTIC_DEVICE` environment variable to target a specific serial device.
+[`util/home_server_listen_meshtastic.py`](./util/home_server_listen_meshtastic.py) is a standalone home-side Meshtastic logger/debug utility. It connects to a Meshtastic node over USB serial, emits structured JSON logs for packet/text/connection events, and automatically reconnects if the serial link drops. It uses the `MESHTASTIC_DEVICE` environment variable to target a specific serial device.
 
-The current production home-server architecture is documented in [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md). That document defines the SQLite-backed ingest pipeline, including the production `parser.py`, `storage.py`, `db.py`, `schema.sql`, and `queue_worker.py` modules. Those home-server modules are described in the architecture doc but are not currently checked into this repository.
+[`homeServer/listen_meshtastic.py`](./homeServer/listen_meshtastic.py) is the production ingest entry point. It parses inbound text packets, stores accepted `obs_st` weather rows in SQLite, records `sys` heartbeat/debug packets in `device_health_events`, stores `evt_precip` and `evt_strike` in `weather_events`, stores `device_status` and `hub_status` in `device_telemetry_events`, and updates `device_status_current`.
+
+[`homeServer/queue_worker.py`](./homeServer/queue_worker.py) drains `aws_delivery_queue` into the AWS ingest API. It reads `API_URL` and `API_KEY` from a `.env` file located one directory above the script (`~/weatherstation-home/.env` in the deployed Pi layout), applies in-process HTTP retries, and persists longer backoff state in SQLite. The SQLite database path is fixed by [`homeServer/db.py`](./homeServer/db.py) to `~/weatherstation-home/weatherstation/weatherstation.db`.
 
 The AWS side in this repository matches the production design:
 
@@ -158,6 +169,8 @@ The architecture document defines these SQLite tables:
 - `weather_readings`
 - `aws_delivery_queue`
 - `device_health_events`
+- `weather_events`
+- `device_telemetry_events`
 - `device_status_current`
 - `ingest_events`
 
@@ -216,7 +229,20 @@ Run the Ecowitt LAN API mock server for local integration work:
 python .\mocks\ecowitt_mock_server_v3.py --host 127.0.0.1 --port 8080
 ```
 
-### Home listener utility
+### Home server pipeline
+
+1. Deploy the [`homeServer/`](./homeServer) files to the Raspberry Pi under `~/weatherstation-home/weatherstation/` or an equivalent layout that preserves the fixed database path in [`homeServer/db.py`](./homeServer/db.py).
+2. Initialize the SQLite database once from [`homeServer/schema.sql`](./homeServer/schema.sql).
+3. Create `~/weatherstation-home/.env` with `API_URL=...` and `API_KEY=...` for [`homeServer/queue_worker.py`](./homeServer/queue_worker.py).
+4. Set `MESHTASTIC_DEVICE` if you want to target a specific serial path for [`homeServer/listen_meshtastic.py`](./homeServer/listen_meshtastic.py).
+5. Run the listener and queue worker as separate long-lived processes:
+
+```bash
+python ~/weatherstation-home/weatherstation/listen_meshtastic.py
+python ~/weatherstation-home/weatherstation/queue_worker.py
+```
+
+### Standalone home listener utility
 
 1. Install the Python dependencies used by [`util/home_server_listen_meshtastic.py`](./util/home_server_listen_meshtastic.py), including `meshtastic` and `pypubsub`.
 2. Set `MESHTASTIC_DEVICE` if you want to target a specific serial path.
@@ -241,14 +267,13 @@ Deploy [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml) or [
 - [`swagger.yml`](./swagger.yml) describes the current AWS HTTP API contract for `POST /observations`, `GET /observations`, and `GET /observations/latest`.
 - [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md) is the current source of truth for the production home-server and AWS design.
 - [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md) captures the broader system and hardware plan.
-- [`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md) is useful background, but the MVP architecture document supersedes it for the current production schema and cloud flow.
+- [`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md) is a secondary home-server design and deployment reference aligned with the checked-in implementation.
 
 ## Current Status
 
 - The production architecture is documented for the full garden -> home server -> AWS path.
-- The repository currently includes the garden bridge, a home Meshtastic listener utility, AWS ingest/read Lambdas, infrastructure templates, and local validation/mock scripts.
-- Some production home-server modules described in the architecture document are not currently present in this repository.
-- There is currently no automated test suite in this repository; validation is script-based.
+- The repository currently includes the garden bridge, the full home-server listener/parser/storage/queue-worker path, a standalone Meshtastic logger utility, AWS ingest/read Lambdas, infrastructure templates, and local validation/mock scripts.
+- There is currently no automated test suite in this repository; validation is still script-based.
 
 ## License
 
