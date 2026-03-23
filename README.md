@@ -12,7 +12,7 @@ The primary production reference is [`documentation/markdown/weather_station_mvp
 
 - Hackaday project page: https://hackaday.io/project/205363-meshtastic-weather-station
 - Live demo: https://www.brahmschultz.com/meshtastic-weather-station
-- Hosted Swagger API: https://agent215.github.io/weatherStationApiSwagger/
+- API (swagger doc): https://agent215.github.io/weatherStationApiSwagger/
 
 ## Production Overview
 
