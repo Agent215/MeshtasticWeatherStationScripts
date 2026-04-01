@@ -88,14 +88,14 @@ With the current garden bridge, `ts` is emitted consistently, so the raw home-si
 
 # 2. Codebase map
 
-This document describes the current production architecture. The production home-server modules described below are checked into `homeServer/`.
+This document describes the current production architecture. The production home-server modules described below are checked into `weatherstation/`.
 
 ## 2.1 Home-side files
 
-### `homeServer/listen_meshtastic.py`
+### `weatherstation/listen_meshtastic.py`
 Long-running listener process on the Raspberry Pi. It connects to the home Meshtastic node over USB serial, receives packets, and routes them into storage.
 
-### `homeServer/parser.py`
+### `weatherstation/parser.py`
 Parses the decoded text payload from Meshtastic and classifies it as:
 
 - weather
@@ -106,35 +106,35 @@ Parses the decoded text payload from Meshtastic and classifies it as:
 - rejected
 - unknown
 
-### `homeServer/storage.py`
+### `weatherstation/storage.py`
 Implements all SQLite writes and queue state transitions.
 
-### `homeServer/app_config.py`
+### `weatherstation/app_config.py`
 Loads shared env/config values for the listener, queue worker, and retention
 job.
 
-### `homeServer/db.py`
+### `weatherstation/db.py`
 Opens SQLite connections and applies database pragmas.
 
-### `homeServer/schema.sql`
+### `weatherstation/schema.sql`
 Defines the SQLite schema.
 
-### `homeServer/queue_worker.py`
+### `weatherstation/queue_worker.py`
 Polls pending rows from the local delivery queue and POSTs them to AWS.
 
-### `homeServer/retention.py`
+### `weatherstation/retention.py`
 Deletes expired local SQLite history in bounded batches.
 
-### `homeServer/commands.txt`
+### `weatherstation/commands.txt`
 Operational command snippets used on the home server during support work.
 
-### `homeServer/util/test_ingest.py`
+### `scripts/home/test_ingest.py`
 Small local ingest smoke script for exercising parser/storage behavior.
 
-### `homeServer/util/show_latest.py`
+### `scripts/home/show_latest.py`
 Simple SQLite inspection helper for recent weather, health, and queue rows.
 
-### `util/home_server_listen_meshtastic.py`
+### `scripts/home/home_server_listen_meshtastic.py`
 Standalone Meshtastic USB logger/debug utility. It is useful during bring-up, but it is not the SQLite/AWS ingest pipeline.
 
 ## 2.2 Garden-side producer files
@@ -163,7 +163,7 @@ AWS read Lambda.
 
 # 3. Home server runtime behavior
 
-## 3.1 `homeServer/listen_meshtastic.py`
+## 3.1 `weatherstation/listen_meshtastic.py`
 
 This is the checked-in entry point for inbound Meshtastic traffic on the home server.
 
@@ -251,7 +251,7 @@ connection is first established. If packet flow stays idle longer than the
 configured timeout, the listener logs `watchdog_timeout`, closes the serial
 interface, and reconnects.
 
-## 3.2 `homeServer/parser.py`
+## 3.2 `weatherstation/parser.py`
 
 The parser converts raw JSON text into a structured `ParsedEvent`.
 
@@ -389,7 +389,7 @@ The parser validates uptime, RSSI, voltage, sequence counters, and the expected 
 - `rejected` means the payload matched a known schema family but failed validation
 - `unknown` means the payload was valid JSON but did not match the supported weather, health, weather-event, or telemetry schemas
 
-## 3.3 `homeServer/storage.py`
+## 3.3 `weatherstation/storage.py`
 
 `storage.py` is the concrete storage layer for the home server. It owns all SQLite writes and queue state transitions.
 
@@ -634,7 +634,7 @@ The worker expects:
 - `API_URL`
 - `API_KEY`
 
-Shared config resolution is handled by `homeServer/app_config.py` in this order:
+Shared config resolution is handled by `weatherstation/app_config.py` in this order:
 
 - `WEATHERSTATION_ENV_PATH` when set
 - `~/weatherstation-home/.env` in the deployed Pi layout
@@ -727,7 +727,7 @@ When posting fails, the worker:
 2. stores the error and next retry time in SQLite
 3. moves on to the next polling cycle
 
-## 3.5 `homeServer/retention.py`
+## 3.5 `weatherstation/retention.py`
 
 `retention.py` is the local SQLite cleanup job used by the current production
 home server.
@@ -756,7 +756,7 @@ delivery.
 
 ### Configuration
 
-`retention.py` reads these settings through `homeServer/app_config.py`:
+`retention.py` reads these settings through `weatherstation/app_config.py`:
 
 - `DB_RETENTION_ENABLED`
 - `DB_RETENTION_DAYS`

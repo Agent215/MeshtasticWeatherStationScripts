@@ -9,8 +9,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from app_config import get_active_env_path, get_bool_env, get_int_env, load_app_env
-from db import get_conn, get_db_path
+try:
+    from .app_config import get_active_env_path, get_bool_env, get_int_env, load_app_env
+    from .db import get_conn, get_db_path
+except ImportError:
+    from app_config import get_active_env_path, get_bool_env, get_int_env, load_app_env
+    from db import get_conn, get_db_path
 
 RUNNING = True
 

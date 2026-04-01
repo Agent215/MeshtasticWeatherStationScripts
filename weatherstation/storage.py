@@ -4,8 +4,12 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from db import get_conn
-from parser import ParsedEvent, payload_hash
+try:
+    from .db import get_conn
+    from .parser import ParsedEvent, payload_hash
+except ImportError:
+    from db import get_conn
+    from parser import ParsedEvent, payload_hash
 
 
 def utc_now() -> str:

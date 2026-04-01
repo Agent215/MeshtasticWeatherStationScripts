@@ -20,21 +20,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from pubsub import pub
 import meshtastic.serial_interface
 
-BASE_DIR = Path.home() / "weatherstation-home"
-sys.path.insert(0, str(BASE_DIR / "weatherstation"))
-
-from parser import parse_text_payload  # noqa: E402
-from storage import (  # noqa: E402
+from weatherstation.parser import parse_text_payload  # noqa: E402
+from weatherstation.storage import (  # noqa: E402
     insert_device_telemetry,
     insert_health,
     insert_weather,
     insert_weather_event,
     record_ingest_event,
 )
-from app_config import get_bool_env, get_int_env  # noqa: E402
+from weatherstation.app_config import get_bool_env, get_int_env  # noqa: E402
 
 RUNNING = True
 DISCONNECT_REQUESTED = threading.Event()

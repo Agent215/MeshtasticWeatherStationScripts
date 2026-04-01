@@ -2,7 +2,7 @@
 
 *Meshtastic Serial Ingest | SQLite Persistence | AWS API Delivery*
 
-This document is an implementation-aligned overview of the checked-in home-server code in [`homeServer/`](../../homeServer). For the exhaustive schema and full end-to-end cloud model, use [`weather_station_mvp_architecture_and_schema.md`](./weather_station_mvp_architecture_and_schema.md).
+This document is an implementation-aligned overview of the checked-in home-server code in [`weatherstation/`](../../weatherstation). For the exhaustive schema and full end-to-end cloud model, use [`weather_station_mvp_architecture_and_schema.md`](../architecture/weather_station_mvp_architecture_and_schema.md).
 
 # 1. Purpose and Scope
 
@@ -30,8 +30,8 @@ Out of scope in the current code:
 
 The checked-in implementation is two cooperating long-lived processes, not one threaded process:
 
-- [`homeServer/listen_meshtastic.py`](../../homeServer/listen_meshtastic.py): serial ingest, parsing, and SQLite writes
-- [`homeServer/queue_worker.py`](../../homeServer/queue_worker.py): AWS delivery worker for queued weather rows
+- [`weatherstation/listen_meshtastic.py`](../../weatherstation/listen_meshtastic.py): serial ingest, parsing, and SQLite writes
+- [`weatherstation/queue_worker.py`](../../weatherstation/queue_worker.py): AWS delivery worker for queued weather rows
 
 High-level data path:
 
@@ -40,24 +40,24 @@ garden weather source
   -> garden Pico bridge
   -> Meshtastic text message
   -> home Meshtastic node over USB serial
-  -> homeServer/listen_meshtastic.py
-  -> homeServer/parser.py
-  -> homeServer/storage.py
+  -> weatherstation/listen_meshtastic.py
+  -> weatherstation/parser.py
+  -> weatherstation/storage.py
   -> SQLite
-  -> homeServer/queue_worker.py
+  -> weatherstation/queue_worker.py
   -> AWS POST /observations
 ```
 
 Supporting files:
 
-- [`homeServer/app_config.py`](../../homeServer/app_config.py): shared environment-file and typed setting loader
-- [`homeServer/db.py`](../../homeServer/db.py): SQLite connection helper
-- [`homeServer/schema.sql`](../../homeServer/schema.sql): schema definition
-- [`homeServer/retention.py`](../../homeServer/retention.py): bounded SQLite retention cleanup job
-- [`homeServer/commands.txt`](../../homeServer/commands.txt): operational command reference used on the Pi
-- [`homeServer/util/test_ingest.py`](../../homeServer/util/test_ingest.py): simple local ingest smoke script
-- [`homeServer/util/show_latest.py`](../../homeServer/util/show_latest.py): quick SQLite inspection helper
-- [`util/home_server_listen_meshtastic.py`](../../util/home_server_listen_meshtastic.py): standalone Meshtastic logger/debug utility, not the production SQLite/AWS pipeline
+- [`weatherstation/app_config.py`](../../weatherstation/app_config.py): shared environment-file and typed setting loader
+- [`weatherstation/db.py`](../../weatherstation/db.py): SQLite connection helper
+- [`weatherstation/schema.sql`](../../weatherstation/schema.sql): schema definition
+- [`weatherstation/retention.py`](../../weatherstation/retention.py): bounded SQLite retention cleanup job
+- [`weatherstation/commands.txt`](../../weatherstation/commands.txt): operational command reference used on the Pi
+- [`scripts/home/test_ingest.py`](../../scripts/home/test_ingest.py): simple local ingest smoke script
+- [`scripts/home/show_latest.py`](../../scripts/home/show_latest.py): quick SQLite inspection helper
+- [`scripts/home/home_server_listen_meshtastic.py`](../../scripts/home/home_server_listen_meshtastic.py): standalone Meshtastic logger/debug utility, not the production SQLite/AWS pipeline
 
 # 3. Packet Classification
 
@@ -133,12 +133,25 @@ Only rows from `weather_readings` are queued for cloud delivery.
 
 Configuration:
 
-- `API_URL` and `API_KEY` are loaded through `homeServer/app_config.py`
+- `API_URL` and `API_KEY` are loaded through `weatherstation/app_config.py`
 - config resolution prefers `~/weatherstation-home/.env`
 - `WEATHERSTATION_ENV_PATH` can point at a different env file
 - `/etc/weatherstation-home.env` is used as a fallback when present
 - `MESHTASTIC_DEVICE` is optional and used by `listen_meshtastic.py`
 - `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC` control the listener reconnect watchdog
+
+In the live home-server setup, the listener-specific Meshtastic settings are
+typically managed in:
+
+```text
+/etc/weatherstation-meshtastic.env
+```
+
+while queue-worker and retention settings are typically managed in:
+
+```text
+/etc/weatherstation-home.env
+```
 
 Retry behavior:
 
@@ -181,7 +194,7 @@ Retention is controlled with these environment variables:
 - `DB_RETENTION_MAX_BATCHES`
 
 Operational reference copies of the live retention units are checked into
-[`docs/systemd/`](../../docs/systemd/).
+[`docs/systemd/`](../systemd/).
 
 # 7. Deployment Notes
 
@@ -223,13 +236,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=weatherstation
-WorkingDirectory=/opt/weatherstation-home
-Environment=MESHTASTIC_DEVICE=/dev/ttyACM0
-Environment=MESHTASTIC_WATCHDOG_ENABLED=true
-Environment=MESHTASTIC_WATCHDOG_TIMEOUT_SEC=600
-Environment=MESHTASTIC_RECONNECT_DELAY_SEC=5
-ExecStart=/opt/weatherstation-home/.venv/bin/python /opt/weatherstation-home/weatherstation/listen_meshtastic.py
+User=gardener
+Group=gardener
+WorkingDirectory=/home/gardener/weatherstation-home/weatherstation
+EnvironmentFile=/etc/weatherstation-meshtastic.env
+ExecStart=/home/gardener/weatherstation-home/.venv/bin/python /home/gardener/weatherstation-home/weatherstation/listen_meshtastic.py
 Restart=always
 RestartSec=5
 
@@ -246,17 +257,25 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=weatherstation
-WorkingDirectory=/opt/weatherstation-home
+User=gardener
+Group=gardener
+WorkingDirectory=/home/gardener/weatherstation-home/weatherstation
 Type=notify
 EnvironmentFile=/etc/weatherstation-home.env
-ExecStart=/opt/weatherstation-home/.venv/bin/python /opt/weatherstation-home/weatherstation/queue_worker.py
+ExecStart=/home/gardener/weatherstation-home/.venv/bin/python /home/gardener/weatherstation-home/weatherstation/queue_worker.py
 Restart=always
 RestartSec=5
 WatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target
+```
+
+The example units above intentionally match the current live deployment path on
+the home server:
+
+```text
+/home/gardener/weatherstation-home
 ```
 
 # 8. Observability and Validation

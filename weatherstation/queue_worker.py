@@ -10,8 +10,12 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib import error, request
 
-from app_config import get_active_env_path, get_required_env, load_app_env
-from storage import fetch_pending_deliveries, mark_delivery_failure, mark_delivery_success
+try:
+    from .app_config import get_active_env_path, get_required_env, load_app_env
+    from .storage import fetch_pending_deliveries, mark_delivery_failure, mark_delivery_success
+except ImportError:
+    from app_config import get_active_env_path, get_required_env, load_app_env
+    from storage import fetch_pending_deliveries, mark_delivery_failure, mark_delivery_success
 
 RUNNING = True
 POLL_INTERVAL_SEC = 5

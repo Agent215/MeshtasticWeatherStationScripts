@@ -6,7 +6,7 @@ The production system is a store-and-forward pipeline:
 
 `weather source -> garden bridge -> Meshtastic -> home Raspberry Pi -> SQLite backlog -> AWS ingest API -> DynamoDB -> read APIs`
 
-The primary production reference is [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md). That document describes the current home-server schema, queueing model, retention behavior, AWS stack, and DynamoDB data model. The checked-in code in this repository now includes the garden bridge, the full `homeServer/` listener/parser/storage/queue-worker pipeline, the shared home-server config loader, the SQLite retention job, the standalone Meshtastic listener utility, the AWS Lambda handlers, and mocks/test utilities.
+The primary production reference is [`docs/architecture/weather_station_mvp_architecture_and_schema.md`](./docs/architecture/weather_station_mvp_architecture_and_schema.md). That document describes the current home-server schema, queueing model, retention behavior, AWS stack, and DynamoDB data model. The checked-in code in this repository now includes the garden bridge, the full `weatherstation/` listener/parser/storage/queue-worker pipeline, the shared home-server config loader, the SQLite retention job, the standalone Meshtastic listener utility, the AWS Lambda handlers, and mocks/test utilities.
 
 ## Project Links
 
@@ -24,19 +24,19 @@ The primary production reference is [`documentation/markdown/weather_station_mvp
 ## Repository Layout
 
 - [`gardenNode/main.py`](./gardenNode/main.py): MicroPython garden bridge for the Raspberry Pi Pico W
-- [`homeServer/listen_meshtastic.py`](./homeServer/listen_meshtastic.py): production home-side Meshtastic ingest process
-- [`homeServer/parser.py`](./homeServer/parser.py): parser/classifier for weather, health, event, telemetry, invalid, rejected, and unknown packets
-- [`homeServer/storage.py`](./homeServer/storage.py): SQLite write path and AWS queue state transitions
-- [`homeServer/app_config.py`](./homeServer/app_config.py): shared `.env` and environment-variable loader used by the listener, queue worker, and retention job
-- [`homeServer/db.py`](./homeServer/db.py): SQLite connection helper with `WEATHERSTATION_DB_PATH` override support
-- [`homeServer/schema.sql`](./homeServer/schema.sql): production home-side SQLite schema
-- [`homeServer/queue_worker.py`](./homeServer/queue_worker.py): production AWS delivery worker
-- [`homeServer/retention.py`](./homeServer/retention.py): bounded SQLite retention cleanup for old local rows
-- [`homeServer/commands.txt`](./homeServer/commands.txt): current operational command snippets used on the home server
-- [`homeServer/util/test_ingest.py`](./homeServer/util/test_ingest.py): simple local ingest smoke script
-- [`homeServer/util/show_latest.py`](./homeServer/util/show_latest.py): quick SQLite inspection helper
-- [`util/home_server_listen_meshtastic.py`](./util/home_server_listen_meshtastic.py): standalone Meshtastic USB listener/logger utility
-- [`util/tempest_udp_listener_test_script.py`](./util/tempest_udp_listener_test_script.py): UDP listener/validator for supported Tempest packet types
+- [`weatherstation/listen_meshtastic.py`](./weatherstation/listen_meshtastic.py): production home-side Meshtastic ingest process
+- [`weatherstation/parser.py`](./weatherstation/parser.py): parser/classifier for weather, health, event, telemetry, invalid, rejected, and unknown packets
+- [`weatherstation/storage.py`](./weatherstation/storage.py): SQLite write path and AWS queue state transitions
+- [`weatherstation/app_config.py`](./weatherstation/app_config.py): shared `.env` and environment-variable loader used by the listener, queue worker, and retention job
+- [`weatherstation/db.py`](./weatherstation/db.py): SQLite connection helper with `WEATHERSTATION_DB_PATH` override support
+- [`weatherstation/schema.sql`](./weatherstation/schema.sql): production home-side SQLite schema
+- [`weatherstation/queue_worker.py`](./weatherstation/queue_worker.py): production AWS delivery worker
+- [`weatherstation/retention.py`](./weatherstation/retention.py): bounded SQLite retention cleanup for old local rows
+- [`weatherstation/commands.txt`](./weatherstation/commands.txt): current operational command snippets used on the home server
+- [`scripts/home/test_ingest.py`](./scripts/home/test_ingest.py): simple local ingest smoke script
+- [`scripts/home/show_latest.py`](./scripts/home/show_latest.py): quick SQLite inspection helper
+- [`scripts/home/home_server_listen_meshtastic.py`](./scripts/home/home_server_listen_meshtastic.py): standalone Meshtastic USB listener/logger utility
+- [`scripts/tempest/tempest_udp_listener_test_script.py`](./scripts/tempest/tempest_udp_listener_test_script.py): UDP listener/validator for supported Tempest packet types
 - [`aws/ingest/app.py`](./aws/ingest/app.py): ingest Lambda for `POST /observations`
 - [`aws/read/app.py`](./aws/read/app.py): read Lambda for `GET /observations` and `GET /observations/latest`
 - [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml): source CloudFormation template
@@ -48,9 +48,10 @@ The primary production reference is [`documentation/markdown/weather_station_mvp
 - [`docs/systemd/README.md`](./docs/systemd/README.md): reference notes for the retention `systemd` units used on the home server
 - [`docs/systemd/weatherstation-db-retention.service`](./docs/systemd/weatherstation-db-retention.service): reference copy of the live retention service unit
 - [`docs/systemd/weatherstation-db-retention.timer`](./docs/systemd/weatherstation-db-retention.timer): reference copy of the live retention timer unit
-- [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md): current production architecture and schema
-- [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md): broader system design background
-- [`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md): earlier home-server design document
+- [`docs/architecture/weather_station_mvp_architecture_and_schema.md`](./docs/architecture/weather_station_mvp_architecture_and_schema.md): current production architecture and schema
+- [`docs/architecture/weather_station_design_revised_v2.md`](./docs/architecture/weather_station_design_revised_v2.md): broader system design background
+- [`docs/operations/home_pi_server_design_spec.md`](./docs/operations/home_pi_server_design_spec.md): focused home-server design and deployment reference
+- [`docs/reference/TemptestFieldGuide.txt`](./docs/reference/TemptestFieldGuide.txt): Tempest packet reference notes captured during field work
 
 ## Garden Bridge
 
@@ -147,17 +148,17 @@ Additional hardware notes that matter in practice:
 - do not feed 5 V UART logic into the RAK UART pins
 - connect the home Meshtastic node to the Raspberry Pi by USB for the most stable long-running gateway link
 - both Meshtastic radios should be configured for the same region and channel/PSK; the earlier design notes assume `US915`
-- the broader hardware and power plan, including antenna and solar/battery notes, is documented in [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md)
+- the broader hardware and power plan, including antenna and solar/battery notes, is documented in [`docs/architecture/weather_station_design_revised_v2.md`](./docs/architecture/weather_station_design_revised_v2.md)
 
 ## Home Side And AWS
 
-[`util/home_server_listen_meshtastic.py`](./util/home_server_listen_meshtastic.py) is a standalone home-side Meshtastic logger/debug utility. It connects to a Meshtastic node over USB serial, emits structured JSON logs for packet/text/connection events, and automatically reconnects if the serial link drops. It uses the `MESHTASTIC_DEVICE` environment variable to target a specific serial device.
+[`scripts/home/home_server_listen_meshtastic.py`](./scripts/home/home_server_listen_meshtastic.py) is a standalone home-side Meshtastic logger/debug utility. It connects to a Meshtastic node over USB serial, emits structured JSON logs for packet/text/connection events, and automatically reconnects if the serial link drops. It uses the `MESHTASTIC_DEVICE` environment variable to target a specific serial device.
 
-[`homeServer/listen_meshtastic.py`](./homeServer/listen_meshtastic.py) is the production ingest entry point. It parses inbound text packets, stores accepted `obs_st` weather rows in SQLite, records `sys` heartbeat/debug packets in `device_health_events`, stores `evt_precip` and `evt_strike` in `weather_events`, stores `device_status` and `hub_status` in `device_telemetry_events`, and updates `device_status_current`. It now also supports a packet-flow watchdog with `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC`.
+[`weatherstation/listen_meshtastic.py`](./weatherstation/listen_meshtastic.py) is the production ingest entry point. It parses inbound text packets, stores accepted `obs_st` weather rows in SQLite, records `sys` heartbeat/debug packets in `device_health_events`, stores `evt_precip` and `evt_strike` in `weather_events`, stores `device_status` and `hub_status` in `device_telemetry_events`, and updates `device_status_current`. It now also supports a packet-flow watchdog with `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC`.
 
-[`homeServer/queue_worker.py`](./homeServer/queue_worker.py) drains `aws_delivery_queue` into the AWS ingest API. It reads `API_URL` and `API_KEY` through [`homeServer/app_config.py`](./homeServer/app_config.py), which prefers `~/weatherstation-home/.env`, supports `WEATHERSTATION_ENV_PATH`, and falls back to `/etc/weatherstation-home.env` when present. [`homeServer/db.py`](./homeServer/db.py) now exposes the default database path `~/weatherstation-home/weatherstation/weatherstation.db` and allows overriding it with `WEATHERSTATION_DB_PATH`.
+[`weatherstation/queue_worker.py`](./weatherstation/queue_worker.py) drains `aws_delivery_queue` into the AWS ingest API. It reads `API_URL` and `API_KEY` through [`weatherstation/app_config.py`](./weatherstation/app_config.py), which prefers `~/weatherstation-home/.env`, supports `WEATHERSTATION_ENV_PATH`, and falls back to `/etc/weatherstation-home.env` when present. [`weatherstation/db.py`](./weatherstation/db.py) now exposes the default database path `~/weatherstation-home/weatherstation/weatherstation.db` and allows overriding it with `WEATHERSTATION_DB_PATH`.
 
-[`homeServer/retention.py`](./homeServer/retention.py) is the current production SQLite cleanup job. It deletes expired rows from `weather_readings`, `device_health_events`, `weather_events`, `device_telemetry_events`, and `ingest_events` in bounded batches, while protecting queued weather rows until they are missing from `aws_delivery_queue` or already marked `delivered`.
+[`weatherstation/retention.py`](./weatherstation/retention.py) is the current production SQLite cleanup job. It deletes expired rows from `weather_readings`, `device_health_events`, `weather_events`, `device_telemetry_events`, and `ingest_events` in bounded batches, while protecting queued weather rows until they are missing from `aws_delivery_queue` or already marked `delivered`.
 
 The AWS side in this repository matches the production design:
 
@@ -228,7 +229,7 @@ python .\mocks\mock_tempest_udp_sender_extended.py --target 192.168.1.205
 Validate incoming Tempest UDP payloads on a workstation or Pi:
 
 ```powershell
-python .\util\tempest_udp_listener_test_script.py --port 50222
+python .\scripts\tempest\tempest_udp_listener_test_script.py --port 50222
 ```
 
 Run the Ecowitt LAN API mock server for local integration work:
@@ -239,10 +240,10 @@ python .\mocks\ecowitt_mock_server_v3.py --host 127.0.0.1 --port 8080
 
 ### Home server pipeline
 
-1. Deploy the [`homeServer/`](./homeServer) files to the Raspberry Pi under `~/weatherstation-home/weatherstation/` or an equivalent layout.
-2. Initialize the SQLite database once from [`homeServer/schema.sql`](./homeServer/schema.sql).
+1. Deploy the [`weatherstation/`](./weatherstation) files to the Raspberry Pi under `~/weatherstation-home/weatherstation/` or an equivalent layout.
+2. Initialize the SQLite database once from [`weatherstation/schema.sql`](./weatherstation/schema.sql).
 3. Create `~/weatherstation-home/.env` with `API_URL=...` and `API_KEY=...`, or use `/etc/weatherstation-home.env`, or point the processes at a different file with `WEATHERSTATION_ENV_PATH`.
-4. Set `MESHTASTIC_DEVICE` if you want to target a specific serial path for [`homeServer/listen_meshtastic.py`](./homeServer/listen_meshtastic.py). Optional listener controls are `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC`.
+4. Set `MESHTASTIC_DEVICE` if you want to target a specific serial path for [`weatherstation/listen_meshtastic.py`](./weatherstation/listen_meshtastic.py). Optional listener controls are `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC`.
 5. If the SQLite file is not stored at `~/weatherstation-home/weatherstation/weatherstation.db`, set `WEATHERSTATION_DB_PATH`.
 6. Optional retention controls are `DB_RETENTION_ENABLED`, `DB_RETENTION_DAYS`, `DB_RETENTION_BATCH_SIZE`, and `DB_RETENTION_MAX_BATCHES`.
 7. Run the listener and queue worker as separate long-lived processes:
@@ -261,12 +262,12 @@ python ~/weatherstation-home/weatherstation/retention.py
 
 ### Standalone home listener utility
 
-1. Install the Python dependencies used by [`util/home_server_listen_meshtastic.py`](./util/home_server_listen_meshtastic.py), including `meshtastic` and `pypubsub`.
+1. Install the Python dependencies used by [`scripts/home/home_server_listen_meshtastic.py`](./scripts/home/home_server_listen_meshtastic.py), including `meshtastic` and `pypubsub`.
 2. Set `MESHTASTIC_DEVICE` if you want to target a specific serial path.
 3. Run:
 
 ```powershell
-python .\util\home_server_listen_meshtastic.py
+python .\scripts\home\home_server_listen_meshtastic.py
 ```
 
 ### AWS stack
@@ -282,10 +283,10 @@ Deploy [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml) or [
 ## Documentation
 
 - [`swagger.yml`](./swagger.yml) describes the current AWS HTTP API contract for `POST /observations`, `GET /observations`, and `GET /observations/latest`.
-- [`documentation/markdown/weather_station_mvp_architecture_and_schema.md`](./documentation/markdown/weather_station_mvp_architecture_and_schema.md) is the current source of truth for the production home-server and AWS design.
-- [`documentation/markdown/weather_station_design_revised_v2.md`](./documentation/markdown/weather_station_design_revised_v2.md) captures the broader system and hardware plan.
-- [`documentation/markdown/home_pi_server_design_spec.md`](./documentation/markdown/home_pi_server_design_spec.md) is a secondary home-server design and deployment reference aligned with the checked-in implementation.
-- [`docs/systemd/README.md`](./docs/systemd/README.md) and the unit files in [`docs/systemd/`](./docs/systemd/) document the live retention `systemd` units currently installed on the home server.
+- [`docs/architecture/weather_station_mvp_architecture_and_schema.md`](./docs/architecture/weather_station_mvp_architecture_and_schema.md) is the current source of truth for the production home-server and AWS design.
+- [`docs/architecture/weather_station_design_revised_v2.md`](./docs/architecture/weather_station_design_revised_v2.md) captures the broader system and hardware plan.
+- [`docs/operations/home_pi_server_design_spec.md`](./docs/operations/home_pi_server_design_spec.md) is the focused home-server runtime and deployment guide.
+- [`docs/systemd/README.md`](./docs/systemd/README.md) and the unit files in [`docs/systemd/`](./docs/systemd/) are operational reference copies of the live retention `systemd` units, not the broader design docs.
 
 ## Current Status
 
