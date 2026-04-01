@@ -1,0 +1,13 @@
+# Reference copy only.
+# Live file on server: /etc/systemd/system/weatherstation-db-retention.timer
+[Unit]
+Description=Run Weather Station SQLite retention daily
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=weatherstation-db-retention.service
+
+[Install]
+WantedBy=timers.target

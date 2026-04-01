@@ -50,8 +50,11 @@ garden weather source
 
 Supporting files:
 
+- [`homeServer/app_config.py`](../../homeServer/app_config.py): shared environment-file and typed setting loader
 - [`homeServer/db.py`](../../homeServer/db.py): SQLite connection helper
 - [`homeServer/schema.sql`](../../homeServer/schema.sql): schema definition
+- [`homeServer/retention.py`](../../homeServer/retention.py): bounded SQLite retention cleanup job
+- [`homeServer/commands.txt`](../../homeServer/commands.txt): operational command reference used on the Pi
 - [`homeServer/util/test_ingest.py`](../../homeServer/util/test_ingest.py): simple local ingest smoke script
 - [`homeServer/util/show_latest.py`](../../homeServer/util/show_latest.py): quick SQLite inspection helper
 - [`util/home_server_listen_meshtastic.py`](../../util/home_server_listen_meshtastic.py): standalone Meshtastic logger/debug utility, not the production SQLite/AWS pipeline
@@ -81,16 +84,20 @@ Important parser details:
 
 # 4. Local Storage Model
 
-The database path is fixed in code:
+The default database path in code is:
 
 ```text
 ~/weatherstation-home/weatherstation/weatherstation.db
 ```
 
+`db.py` also supports `WEATHERSTATION_DB_PATH` when the deployed database lives
+somewhere else.
+
 `db.py` opens SQLite with:
 
 - `PRAGMA foreign_keys=ON`
 - `PRAGMA journal_mode=WAL`
+- `PRAGMA busy_timeout=<timeout_sec * 1000>`
 - `sqlite3.Row` row objects
 
 The checked-in schema contains these tables:
@@ -126,9 +133,12 @@ Only rows from `weather_readings` are queued for cloud delivery.
 
 Configuration:
 
-- `API_URL` and `API_KEY` are loaded from the `.env` file one directory above `queue_worker.py`
-- in the deployed Pi layout that path is `~/weatherstation-home/.env`
+- `API_URL` and `API_KEY` are loaded through `homeServer/app_config.py`
+- config resolution prefers `~/weatherstation-home/.env`
+- `WEATHERSTATION_ENV_PATH` can point at a different env file
+- `/etc/weatherstation-home.env` is used as a fallback when present
 - `MESHTASTIC_DEVICE` is optional and used by `listen_meshtastic.py`
+- `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC` control the listener reconnect watchdog
 
 Retry behavior:
 
@@ -147,7 +157,33 @@ Current validation mismatch worth documenting:
 
 That means some rows can be accepted into local SQLite and later fail cloud delivery until the data or code changes.
 
-# 6. Deployment Notes
+# 6. Retention And Cleanup
+
+`retention.py` is the current production cleanup job for the local SQLite
+database.
+
+It:
+
+- deletes expired rows from `weather_readings`, `device_health_events`,
+  `weather_events`, `device_telemetry_events`, and `ingest_events`
+- never deletes `device_status_current`
+- only deletes `weather_readings` when the matching queue row is absent or
+  already marked `delivered`
+- runs in bounded batches so the database does not hold long write locks
+- runs `PRAGMA optimize` after live cleanup and performs a passive WAL
+  checkpoint when rows were deleted
+
+Retention is controlled with these environment variables:
+
+- `DB_RETENTION_ENABLED`
+- `DB_RETENTION_DAYS`
+- `DB_RETENTION_BATCH_SIZE`
+- `DB_RETENTION_MAX_BATCHES`
+
+Operational reference copies of the live retention units are checked into
+[`docs/systemd/`](../../docs/systemd/).
+
+# 7. Deployment Notes
 
 The code assumes a deployed layout like:
 
@@ -155,12 +191,14 @@ The code assumes a deployed layout like:
 ~/weatherstation-home/
   .env
   weatherstation/
+    app_config.py
     listen_meshtastic.py
     queue_worker.py
     parser.py
     storage.py
     db.py
     schema.sql
+    retention.py
 ```
 
 Initialize the database once before starting the services:
@@ -173,6 +211,8 @@ Typical service model:
 
 - one systemd unit for `listen_meshtastic.py`
 - one systemd unit for `queue_worker.py`
+- one daily `weatherstation-db-retention.timer` for `retention.py` when local
+  history cleanup is enabled
 
 Example listener unit:
 
@@ -186,6 +226,9 @@ Wants=network-online.target
 User=weatherstation
 WorkingDirectory=/opt/weatherstation-home
 Environment=MESHTASTIC_DEVICE=/dev/ttyACM0
+Environment=MESHTASTIC_WATCHDOG_ENABLED=true
+Environment=MESHTASTIC_WATCHDOG_TIMEOUT_SEC=600
+Environment=MESHTASTIC_RECONNECT_DELAY_SEC=5
 ExecStart=/opt/weatherstation-home/.venv/bin/python /opt/weatherstation-home/weatherstation/listen_meshtastic.py
 Restart=always
 RestartSec=5
@@ -206,6 +249,7 @@ Wants=network-online.target
 User=weatherstation
 WorkingDirectory=/opt/weatherstation-home
 Type=notify
+EnvironmentFile=/etc/weatherstation-home.env
 ExecStart=/opt/weatherstation-home/.venv/bin/python /opt/weatherstation-home/weatherstation/queue_worker.py
 Restart=always
 RestartSec=5
@@ -215,7 +259,7 @@ WatchdogSec=30
 WantedBy=multi-user.target
 ```
 
-# 7. Observability and Validation
+# 8. Observability and Validation
 
 Both runtime scripts log structured one-line JSON to stdout.
 
@@ -233,6 +277,8 @@ Representative listener events:
 - `telemetry_saved`
 - `packet_not_saved`
 - `connect_error`
+- `watchdog_timeout`
+- `reconnect_scheduled`
 - `meshtastic_connected`
 - `meshtastic_disconnected`
 
@@ -247,9 +293,17 @@ Representative queue-worker events:
 - `queue_worker_error`
 - `queue_worker_stop`
 
+Representative retention events:
+
+- `retention_start`
+- `retention_table_dry_run`
+- `retention_batch_deleted`
+- `retention_table_complete`
+- `retention_complete`
+
 Validation in this repository is still script-based rather than test-suite-based.
 
-# 8. Current Limitations
+# 9. Current Limitations
 
 The checked-in implementation intentionally does not do the following yet:
 

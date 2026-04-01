@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
+"""Production Meshtastic ingest listener for the home-side server.
+
+This process connects to the USB-attached Meshtastic radio identified by
+`MESHTASTIC_DEVICE`, subscribes to packet and connection lifecycle events, and
+logs structured JSON records to stdout. Inbound text packets are parsed and
+stored in SQLite as weather, health, weather-event, or telemetry records, and
+the listener will retry the serial connection if the radio is unplugged, the
+link drops, or packet flow stalls long enough to trip the watchdog.
+"""
 from __future__ import annotations
 
 import json
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +34,42 @@ from storage import (  # noqa: E402
     insert_weather_event,
     record_ingest_event,
 )
+from app_config import get_bool_env, get_int_env  # noqa: E402
 
 RUNNING = True
+DISCONNECT_REQUESTED = threading.Event()
+PACKET_ACTIVITY_LOCK = threading.Lock()
+LAST_PACKET_MONOTONIC: float | None = None
+
+
+def mark_packet_activity(seen_at_monotonic: float | None = None) -> None:
+    global LAST_PACKET_MONOTONIC
+
+    if seen_at_monotonic is None:
+        seen_at_monotonic = time.monotonic()
+
+    with PACKET_ACTIVITY_LOCK:
+        LAST_PACKET_MONOTONIC = seen_at_monotonic
+
+
+def clear_packet_activity() -> None:
+    global LAST_PACKET_MONOTONIC
+
+    with PACKET_ACTIVITY_LOCK:
+        LAST_PACKET_MONOTONIC = None
+
+
+def get_packet_idle_seconds(now_monotonic: float | None = None) -> float | None:
+    with PACKET_ACTIVITY_LOCK:
+        last_packet_monotonic = LAST_PACKET_MONOTONIC
+
+    if last_packet_monotonic is None:
+        return None
+
+    if now_monotonic is None:
+        now_monotonic = time.monotonic()
+
+    return max(0.0, now_monotonic - last_packet_monotonic)
 
 
 def utc_now() -> str:
@@ -201,6 +245,8 @@ def process_text_packet(
 
 
 def on_receive(packet: dict[str, Any], interface: Any) -> None:
+    mark_packet_activity()
+
     from_id, from_name = get_source_info(packet)
     decoded = packet.get("decoded", {})
     portnum = decoded.get("portnum")
@@ -240,10 +286,13 @@ def on_receive(packet: dict[str, Any], interface: Any) -> None:
 
 
 def on_connection_established(interface: Any, topic: str = None) -> None:
+    DISCONNECT_REQUESTED.clear()
+    mark_packet_activity()
     log_event("meshtastic_connected")
 
 
 def on_connection_lost(interface: Any, topic: str = None) -> None:
+    DISCONNECT_REQUESTED.set()
     log_event("meshtastic_disconnected")
 
 
@@ -257,29 +306,60 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    device = os.environ.get("MESHTASTIC_DEVICE")
-    reconnect_delay_sec = 5
+    try:
+        device = os.environ.get("MESHTASTIC_DEVICE")
+        reconnect_delay_sec = get_int_env("MESHTASTIC_RECONNECT_DELAY_SEC", 5, minimum=1)
+        watchdog_enabled = get_bool_env("MESHTASTIC_WATCHDOG_ENABLED", True)
+        watchdog_timeout_sec = get_int_env("MESHTASTIC_WATCHDOG_TIMEOUT_SEC", 600, minimum=1)
+    except RuntimeError as exc:
+        log_event("meshtastic_config_error", error=str(exc))
+        return 1
 
     pub.subscribe(on_receive, "meshtastic.receive")
     pub.subscribe(on_connection_established, "meshtastic.connection.established")
     pub.subscribe(on_connection_lost, "meshtastic.connection.lost")
 
-    log_event("service_start", device=device)
+    log_event(
+        "service_start",
+        device=device,
+        reconnect_delay_sec=reconnect_delay_sec,
+        watchdog_enabled=watchdog_enabled,
+        watchdog_timeout_sec=watchdog_timeout_sec,
+    )
 
     while RUNNING:
         interface = None
+        should_retry = False
         try:
+            DISCONNECT_REQUESTED.clear()
+            clear_packet_activity()
             log_event("connecting", device=device)
             interface = meshtastic.serial_interface.SerialInterface(devPath=device)
+            mark_packet_activity()
             log_event("connected", device=device)
 
-            while RUNNING:
-                time.sleep(1)
+            while RUNNING and not DISCONNECT_REQUESTED.wait(timeout=1):
+                if not watchdog_enabled:
+                    continue
+
+                idle_seconds = get_packet_idle_seconds()
+                if idle_seconds is None or idle_seconds < watchdog_timeout_sec:
+                    continue
+
+                log_event(
+                    "watchdog_timeout",
+                    device=device,
+                    idle_seconds=round(idle_seconds, 3),
+                    timeout_sec=watchdog_timeout_sec,
+                )
+                should_retry = RUNNING
+                break
+
+            should_retry = should_retry or (RUNNING and DISCONNECT_REQUESTED.is_set())
 
         except Exception as exc:
             log_event("connect_error", error=str(exc))
-            if RUNNING:
-                time.sleep(reconnect_delay_sec)
+            should_retry = RUNNING
 
         finally:
             try:
@@ -287,6 +367,12 @@ def main() -> int:
                     interface.close()
             except Exception:
                 pass
+            clear_packet_activity()
+            DISCONNECT_REQUESTED.clear()
+
+        if should_retry:
+            log_event("reconnect_scheduled", delay_sec=reconnect_delay_sec)
+            time.sleep(reconnect_delay_sec)
 
     log_event("service_stop")
     return 0

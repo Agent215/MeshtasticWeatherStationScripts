@@ -1,0 +1,8 @@
+1. Power GL router, join it, open 192.168.8.1.
+2. Set/check 2.4 GHz SSID + password.
+3. Put Pico on that same Wi-Fi; confirm IP is 192.168.8.x.
+4. In Tempest app: Settings → Stations → station → WiFi Setup.
+5. Pick GL router SSID, enter password, keep hub near router.
+6. Final check: hub + Pico on same subnet, Pico receiving UDP 50222.
+
+Extra reminder: keep your laptop on Wi-Fi only while testing; unplug Ethernet/VPN.

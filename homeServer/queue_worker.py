@@ -7,10 +7,10 @@ import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 from urllib import error, request
 
+from app_config import get_active_env_path, get_required_env, load_app_env
 from storage import fetch_pending_deliveries, mark_delivery_failure, mark_delivery_success
 
 RUNNING = True
@@ -19,7 +19,6 @@ HTTP_TIMEOUT_SEC = 15
 MAX_POST_ATTEMPTS = 5
 INITIAL_RETRY_DELAY_SEC = 2.0
 MAX_RETRY_DELAY_SEC = 30.0
-ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 
@@ -134,39 +133,8 @@ def handle_signal(signum: int, frame: Any) -> None:
     log_event("shutdown_requested", signal=signum)
 
 
-def load_dotenv_file(env_path: Path) -> None:
-    if not env_path.is_file():
-        return
-
-    for line_number, raw_line in enumerate(env_path.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        key, separator, value = line.partition("=")
-        if not separator:
-            raise RuntimeError(f"Invalid .env entry at line {line_number}: expected KEY=VALUE")
-
-        key = key.removeprefix("export ").strip()
-        if not key:
-            raise RuntimeError(f"Invalid .env entry at line {line_number}: missing key")
-
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-
-        os.environ.setdefault(key, value)
-
-
-def get_required_env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if value:
-        return value
-    raise RuntimeError(f"Missing required setting: {name}")
-
-
 def load_api_config() -> ApiConfig:
-    load_dotenv_file(ENV_PATH)
+    load_app_env()
     return ApiConfig(
         api_url=get_required_env("API_URL"),
         api_key=get_required_env("API_KEY"),
@@ -393,11 +361,11 @@ def main() -> int:
     try:
         api_config = load_api_config()
     except Exception as exc:
-        log_event("queue_worker_config_error", error=str(exc), env_path=str(ENV_PATH))
+        log_event("queue_worker_config_error", error=str(exc), env_path=str(get_active_env_path()))
         notifier.status(f"config error: {exc}")
         return 1
 
-    log_event("queue_worker_start", api_url=api_config.api_url, env_path=str(ENV_PATH))
+    log_event("queue_worker_start", api_url=api_config.api_url, env_path=str(get_active_env_path()))
     notifier.ready("weather queue worker started")
 
     while RUNNING:

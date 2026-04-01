@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +22,7 @@ from pubsub import pub
 import meshtastic.serial_interface
 
 RUNNING = True
+DISCONNECT_REQUESTED = threading.Event()
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -105,9 +107,11 @@ def on_text(packet: dict[str, Any], interface: Any) -> None:
     )
 
 def on_connection_established(interface: Any, topic: str = None) -> None:
+    DISCONNECT_REQUESTED.clear()
     log_event("meshtastic_connected")
 
 def on_connection_lost(interface: Any, topic: str = None) -> None:
+    DISCONNECT_REQUESTED.set()
     log_event("meshtastic_disconnected")
 
 def handle_signal(signum: int, frame: Any) -> None:
@@ -131,18 +135,21 @@ def main() -> int:
 
     while RUNNING:
         interface = None
+        should_retry = False
         try:
+            DISCONNECT_REQUESTED.clear()
             log_event("connecting", device=device)
             interface = meshtastic.serial_interface.SerialInterface(devPath=device)
             log_event("connected", device=device)
 
-            while RUNNING:
-                time.sleep(1)
+            while RUNNING and not DISCONNECT_REQUESTED.wait(timeout=1):
+                pass
+
+            should_retry = RUNNING and DISCONNECT_REQUESTED.is_set()
 
         except Exception as exc:
             log_event("connect_error", error=str(exc))
-            if RUNNING:
-                time.sleep(reconnect_delay_sec)
+            should_retry = RUNNING
 
         finally:
             try:
@@ -150,6 +157,10 @@ def main() -> int:
                     interface.close()
             except Exception:
                 pass
+            DISCONNECT_REQUESTED.clear()
+
+        if should_retry:
+            time.sleep(reconnect_delay_sec)
 
     log_event("service_stop")
     return 0

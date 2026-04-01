@@ -1,0 +1,18 @@
+# Reference copy only.
+# Live file on server: /etc/systemd/system/weatherstation-db-retention.service
+# Environment file on server: /etc/weatherstation-home.env
+[Unit]
+Description=Weather Station SQLite retention cleanup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=gardener
+Group=gardener
+WorkingDirectory=/home/gardener/weatherstation-home/weatherstation
+EnvironmentFile=/etc/weatherstation-home.env
+ExecStart=/home/gardener/weatherstation-home/.venv/bin/python /home/gardener/weatherstation-home/weatherstation/retention.py
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

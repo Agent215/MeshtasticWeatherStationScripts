@@ -10,6 +10,8 @@ line flags control the target address, port, send intervals, loop tick, and
 lightning frequency. Each loop iteration checks which message types are due,
 updates the synthetic weather model for new observations, sends JSON over UDP,
 and prints the payload so runs are easy to inspect.
+
+you can pass `--target` to a Pico's IP for unicast testing, or use `--target 192.168.8.105` for example, or use `--target 192.168.8.105`
 """
 from __future__ import annotations
 

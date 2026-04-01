@@ -109,6 +109,10 @@ Parses the decoded text payload from Meshtastic and classifies it as:
 ### `homeServer/storage.py`
 Implements all SQLite writes and queue state transitions.
 
+### `homeServer/app_config.py`
+Loads shared env/config values for the listener, queue worker, and retention
+job.
+
 ### `homeServer/db.py`
 Opens SQLite connections and applies database pragmas.
 
@@ -117,6 +121,12 @@ Defines the SQLite schema.
 
 ### `homeServer/queue_worker.py`
 Polls pending rows from the local delivery queue and POSTs them to AWS.
+
+### `homeServer/retention.py`
+Deletes expired local SQLite history in bounded batches.
+
+### `homeServer/commands.txt`
+Operational command snippets used on the home server during support work.
 
 ### `homeServer/util/test_ingest.py`
 Small local ingest smoke script for exercising parser/storage behavior.
@@ -167,7 +177,8 @@ This is the checked-in entry point for inbound Meshtastic traffic on the home se
 - passes text payloads into the parser
 - calls storage functions based on parser output
 - logs structured JSON events
-- reconnects automatically if the serial link drops
+- reconnects automatically if the serial link drops or packet flow stalls long
+  enough to trip the listener watchdog
 
 ### Packet metadata captured
 
@@ -225,6 +236,20 @@ record_ingest_event(parsed)
 ```
 
 That makes malformed, rejected, and unexpected packets visible for troubleshooting.
+
+### Listener runtime controls
+
+`listen_meshtastic.py` reads these environment variables:
+
+- `MESHTASTIC_DEVICE`
+- `MESHTASTIC_WATCHDOG_ENABLED`
+- `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`
+- `MESHTASTIC_RECONNECT_DELAY_SEC`
+
+The watchdog marks packet activity whenever packets are received or the
+connection is first established. If packet flow stays idle longer than the
+configured timeout, the listener logs `watchdog_timeout`, closes the serial
+interface, and reconnects.
 
 ## 3.2 `homeServer/parser.py`
 
@@ -594,7 +619,7 @@ The queue worker is the home server process that drains SQLite into AWS.
 
 ### Core responsibilities
 
-- load API URL and secret from `.env`
+- load API URL and secret from shared app config
 - poll SQLite for pending deliveries
 - build the AWS request body
 - POST to the cloud API
@@ -609,10 +634,15 @@ The worker expects:
 - `API_URL`
 - `API_KEY`
 
-The `.env` file is resolved as the directory above `queue_worker.py`:
+Shared config resolution is handled by `homeServer/app_config.py` in this order:
 
-- deployed Pi layout: `~/weatherstation-home/.env`
-- when run in-place from this repository: `<repo root>/.env`
+- `WEATHERSTATION_ENV_PATH` when set
+- `~/weatherstation-home/.env` in the deployed Pi layout
+- `/etc/weatherstation-home.env` when present
+
+The queue worker logs the active resolved env path at startup and on config
+errors, which makes it easier to tell whether the service picked up the
+intended file.
 
 ### Request body construction
 
@@ -697,23 +727,78 @@ When posting fails, the worker:
 2. stores the error and next retry time in SQLite
 3. moves on to the next polling cycle
 
-## 3.5 `db.py`
+## 3.5 `homeServer/retention.py`
+
+`retention.py` is the local SQLite cleanup job used by the current production
+home server.
+
+### What it deletes
+
+The retention job can delete expired rows from:
+
+- `weather_readings`
+- `device_health_events`
+- `weather_events`
+- `device_telemetry_events`
+- `ingest_events`
+
+It never deletes `device_status_current`.
+
+### Safety rule for weather rows
+
+`weather_readings` rows are eligible only when:
+
+- `received_at_utc` is older than the retention cutoff
+- and the matching queue row is missing or already marked `delivered`
+
+That prevents retention from removing queued weather rows that still need cloud
+delivery.
+
+### Configuration
+
+`retention.py` reads these settings through `homeServer/app_config.py`:
+
+- `DB_RETENTION_ENABLED`
+- `DB_RETENTION_DAYS`
+- `DB_RETENTION_BATCH_SIZE`
+- `DB_RETENTION_MAX_BATCHES`
+
+It also supports `--dry-run`, `--retention-days`, `--batch-size`, and
+`--max-batches` command-line overrides.
+
+### Runtime behavior
+
+The cleanup job:
+
+- deletes in bounded batches to avoid long write locks
+- runs `PRAGMA optimize` after live cleanup
+- performs a passive WAL checkpoint when rows were deleted
+- logs structured JSON events such as `retention_start`,
+  `retention_batch_deleted`, and `retention_complete`
+
+Operational reference copies of the live retention `systemd` units are checked
+into `docs/systemd/`.
+
+## 3.6 `db.py`
 
 `db.py` defines the SQLite database location and connection settings.
 
 ### Database path
 
-The current database file is:
+The default database file is:
 
 ```text
 ~/weatherstation-home/weatherstation/weatherstation.db
 ```
+
+If `WEATHERSTATION_DB_PATH` is set, `db.py` uses that path instead.
 
 ### Connection behavior
 
 Every connection:
 
 - uses `sqlite3.Row` row objects
+- applies a configurable SQLite timeout and matching `PRAGMA busy_timeout`
 - enables `PRAGMA foreign_keys=ON`
 - enables `PRAGMA journal_mode=WAL`
 

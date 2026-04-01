@@ -1,0 +1,27 @@
+sudo systemctl restart weatherstation-queue-worker.service
+sudo systemctl restart weatherstation-meshtastic.service
+journalctl -u weatherstation-queue-worker.service -f
+journalctl -u weatherstation-meshtastic.service -f
+journalctl -u weatherstation-meshtastic.service -n 100 --no-pager
+journalctl -k -n 100 --no-pager
+
+# Meshtastic watchdog settings live in /etc/weatherstation-meshtastic.env
+sudo nano /etc/weatherstation-meshtastic.env
+
+# Retention rollout on the home server
+sudo nano /etc/weatherstation-home.env
+set -a
+. /etc/weatherstation-home.env
+set +a
+python3 weatherstation/retention.py --dry-run
+python3 weatherstation/retention.py
+
+# Reference copies of the retention units live in docs/systemd/
+systemctl cat weatherstation-db-retention.service
+systemctl cat weatherstation-db-retention.timer
+sudo nano /etc/systemd/system/weatherstation-db-retention.service
+sudo nano /etc/systemd/system/weatherstation-db-retention.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now weatherstation-db-retention.timer
+systemctl list-timers weatherstation-db-retention.timer
+journalctl -u weatherstation-db-retention.service -n 100 --no-pager
