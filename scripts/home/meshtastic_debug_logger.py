@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Listen to a local Meshtastic radio and emit structured JSON logs.
+"""Standalone Meshtastic debug logger for the home-side USB radio.
 
-This script connects to the Meshtastic device identified by the
-`MESHTASTIC_DEVICE` environment variable, subscribes to packet, text, and
-connection lifecycle events from the Meshtastic pubsub interface, and prints
-each event to stdout as a JSON record with a UTC timestamp. It stays in a
-simple reconnect loop so the process can recover from temporary disconnects,
-and it exits cleanly when SIGINT or SIGTERM is received.
+This utility is for bring-up and troubleshooting only. It connects to the
+Meshtastic device identified by `MESHTASTIC_DEVICE`, subscribes to packet,
+text, and connection lifecycle events, and prints structured JSON to stdout.
+
+Unlike `weatherstation/listen_meshtastic.py`, this script does not parse
+weather payloads, write to SQLite, enqueue AWS delivery work, or participate
+in the production ingest pipeline. Use it when you want to confirm serial
+connectivity, inspect raw traffic, or debug reconnect behavior in isolation.
 """
 from __future__ import annotations
 
