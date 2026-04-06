@@ -312,28 +312,32 @@ def main() -> None:
         while True:
             now_monotonic = time.monotonic()
 
-            if now_monotonic - last_hub_status_at >= args.hub_status_interval:
-                send_packet(sock, args.target, args.port, build_hub_status(state))
-                last_hub_status_at = now_monotonic
+            try:
+                if now_monotonic - last_hub_status_at >= args.hub_status_interval:
+                    send_packet(sock, args.target, args.port, build_hub_status(state))
+                    last_hub_status_at = now_monotonic
 
-            if now_monotonic - last_device_status_at >= args.device_status_interval:
-                send_packet(sock, args.target, args.port, build_device_status(state))
-                last_device_status_at = now_monotonic
+                if now_monotonic - last_device_status_at >= args.device_status_interval:
+                    send_packet(sock, args.target, args.port, build_device_status(state))
+                    last_device_status_at = now_monotonic
 
-            if now_monotonic - last_obs_at >= args.obs_interval:
-                wx = state.evolve_weather(args.strike_chance)
-                send_packet(sock, args.target, args.port, build_obs_st(state, wx))
+                if now_monotonic - last_obs_at >= args.obs_interval:
+                    wx = state.evolve_weather(args.strike_chance)
+                    send_packet(sock, args.target, args.port, build_obs_st(state, wx))
 
-                raining_now = wx["rain_interval_mm"] > 0
-                if raining_now and not previous_raining:
-                    send_packet(sock, args.target, args.port, build_evt_precip(state, wx))
-                previous_raining = raining_now
+                    raining_now = wx["rain_interval_mm"] > 0
+                    if raining_now and not previous_raining:
+                        send_packet(sock, args.target, args.port, build_evt_precip(state, wx))
+                    previous_raining = raining_now
 
-                if wx["lightning_strike_count"] > 0:
-                    for _ in range(wx["lightning_strike_count"]):
-                        send_packet(sock, args.target, args.port, build_evt_strike(state, wx))
+                    if wx["lightning_strike_count"] > 0:
+                        for _ in range(wx["lightning_strike_count"]):
+                            send_packet(sock, args.target, args.port, build_evt_strike(state, wx))
 
-                last_obs_at = now_monotonic
+                    last_obs_at = now_monotonic
+            except OSError:
+                # Silently drop packets if network/routing is temporarily unavailable (e.g. WiFi hot swap)
+                pass
 
             time.sleep(args.tick)
     except KeyboardInterrupt:

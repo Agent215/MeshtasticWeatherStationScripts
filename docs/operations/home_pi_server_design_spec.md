@@ -57,7 +57,7 @@ Supporting files:
 - [`weatherstation/commands.txt`](../../weatherstation/commands.txt): operational command reference used on the Pi
 - [`scripts/home/test_ingest.py`](../../scripts/home/test_ingest.py): simple local ingest smoke script
 - [`scripts/home/show_latest.py`](../../scripts/home/show_latest.py): quick SQLite inspection helper
-- [`scripts/home/home_server_listen_meshtastic.py`](../../scripts/home/home_server_listen_meshtastic.py): standalone Meshtastic logger/debug utility, not the production SQLite/AWS pipeline
+- [`scripts/home/meshtastic_debug_logger.py`](../../scripts/home/meshtastic_debug_logger.py): standalone Meshtastic debug logger, not the production SQLite/AWS pipeline
 
 # 3. Packet Classification
 

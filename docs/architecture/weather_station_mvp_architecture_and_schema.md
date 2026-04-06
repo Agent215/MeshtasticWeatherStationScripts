@@ -134,8 +134,8 @@ Small local ingest smoke script for exercising parser/storage behavior.
 ### `scripts/home/show_latest.py`
 Simple SQLite inspection helper for recent weather, health, and queue rows.
 
-### `scripts/home/home_server_listen_meshtastic.py`
-Standalone Meshtastic USB logger/debug utility. It is useful during bring-up, but it is not the SQLite/AWS ingest pipeline.
+### `scripts/home/meshtastic_debug_logger.py`
+Standalone Meshtastic USB debug logger. It is useful during bring-up and troubleshooting, but it is not the SQLite/AWS ingest pipeline.
 
 ## 2.2 Garden-side producer files
 

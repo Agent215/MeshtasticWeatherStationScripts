@@ -35,7 +35,7 @@ The primary production reference is [`docs/architecture/weather_station_mvp_arch
 - [`weatherstation/commands.txt`](./weatherstation/commands.txt): current operational command snippets used on the home server
 - [`scripts/home/test_ingest.py`](./scripts/home/test_ingest.py): simple local ingest smoke script
 - [`scripts/home/show_latest.py`](./scripts/home/show_latest.py): quick SQLite inspection helper
-- [`scripts/home/home_server_listen_meshtastic.py`](./scripts/home/home_server_listen_meshtastic.py): standalone Meshtastic USB listener/logger utility
+- [`scripts/home/meshtastic_debug_logger.py`](./scripts/home/meshtastic_debug_logger.py): standalone Meshtastic USB debug logger
 - [`scripts/tempest/tempest_udp_listener_test_script.py`](./scripts/tempest/tempest_udp_listener_test_script.py): UDP listener/validator for supported Tempest packet types
 - [`aws/ingest/app.py`](./aws/ingest/app.py): ingest Lambda for `POST /observations`
 - [`aws/read/app.py`](./aws/read/app.py): read Lambda for `GET /observations` and `GET /observations/latest`
@@ -152,7 +152,7 @@ Additional hardware notes that matter in practice:
 
 ## Home Side And AWS
 
-[`scripts/home/home_server_listen_meshtastic.py`](./scripts/home/home_server_listen_meshtastic.py) is a standalone home-side Meshtastic logger/debug utility. It connects to a Meshtastic node over USB serial, emits structured JSON logs for packet/text/connection events, and automatically reconnects if the serial link drops. It uses the `MESHTASTIC_DEVICE` environment variable to target a specific serial device.
+[`scripts/home/meshtastic_debug_logger.py`](./scripts/home/meshtastic_debug_logger.py) is a standalone home-side Meshtastic debug logger. It connects to a Meshtastic node over USB serial, emits structured JSON logs for packet/text/connection events, and automatically reconnects if the serial link drops. It is useful for link bring-up and troubleshooting because it does not parse payloads or write to SQLite. It uses the `MESHTASTIC_DEVICE` environment variable to target a specific serial device.
 
 [`weatherstation/listen_meshtastic.py`](./weatherstation/listen_meshtastic.py) is the production ingest entry point. It parses inbound text packets, stores accepted `obs_st` weather rows in SQLite, records `sys` heartbeat/debug packets in `device_health_events`, stores `evt_precip` and `evt_strike` in `weather_events`, stores `device_status` and `hub_status` in `device_telemetry_events`, and updates `device_status_current`. It now also supports a packet-flow watchdog with `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC`.
 
@@ -260,14 +260,14 @@ python ~/weatherstation-home/weatherstation/retention.py --dry-run
 python ~/weatherstation-home/weatherstation/retention.py
 ```
 
-### Standalone home listener utility
+### Standalone Meshtastic debug logger
 
-1. Install the Python dependencies used by [`scripts/home/home_server_listen_meshtastic.py`](./scripts/home/home_server_listen_meshtastic.py), including `meshtastic` and `pypubsub`.
+1. Install the Python dependencies used by [`scripts/home/meshtastic_debug_logger.py`](./scripts/home/meshtastic_debug_logger.py), including `meshtastic` and `pypubsub`.
 2. Set `MESHTASTIC_DEVICE` if you want to target a specific serial path.
 3. Run:
 
 ```powershell
-python .\scripts\home\home_server_listen_meshtastic.py
+python .\scripts\home\meshtastic_debug_logger.py
 ```
 
 ### AWS stack
