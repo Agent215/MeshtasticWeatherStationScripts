@@ -164,7 +164,7 @@ PACKET_VALIDATORS: Dict[str, Callable[[Dict[str, Any]], Optional[str]]] = {
 
 
 def summarize_packet(message: Dict[str, Any]) -> str:
-    packet_type = message["type"]
+    packet_type = message["type"] 
     serial = message.get("serial_number", "unknown")
     hub = message.get("hub_sn")
 
@@ -201,11 +201,16 @@ def start_listener(port: int) -> None:
     logging.info("Listening for Tempest UDP packets on port %s...", port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(1.0)
     sock.bind(("", port))
 
     try:
         while True:
-            data, addr = sock.recvfrom(65535)
+            try:
+                data, addr = sock.recvfrom(65535)
+            except socket.timeout:
+                continue
             raw = data.decode("utf-8", errors="replace").strip()
 
             try:
