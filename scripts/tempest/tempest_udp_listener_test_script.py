@@ -12,6 +12,12 @@ Use for validation that actual weather station is generating expected packets. I
 then we need to update the listener code to handle the new packet structure. 
 Also useful for testing the listener code with a mock sender that can generate valid and invalid packets on demand.
 
+NOTE (Linux / Arch): Wi-Fi power save will cause missed UDP packets.
+Disable it before running:
+    sudo iw dev <wlan-interface> set power_save off
+Re-enable after:
+    sudo iw dev <wlan-interface> set power_save on
+
 """
 
 import argparse
