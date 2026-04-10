@@ -143,7 +143,9 @@ Standalone Meshtastic USB debug logger. It is useful during bring-up and trouble
 Garden-side controller / bridge. It rate-limits outgoing weather messages, attaches `msg_id`, carries forward the source timestamp, and sends health/debug packets periodically.
 
 ### `mocks/mock_tempest_udp_sender.py`
-A local test generator for Tempest-style UDP packets.
+A local test generator for live-shape Tempest-style UDP packets, including
+18-field `obs_st` payloads with nullable wind slots and separate
+`rapid_wind` packets.
 
 ## 2.3 AWS files
 
@@ -305,6 +307,8 @@ Optional weather/detail fields include:
 - `nrd` = local day nearcast rain
 - `pa` = precipitation analysis type
 
+For the current local UDP `obs_st` v171 intake path, `ws` is part of the official payload, while `rd`, `nr`, `nrd`, and `pa` are normally absent unless another upstream source or future protocol revision provides them.
+
 The parser stores `ts` twice for weather:
 
 - as the raw string `source_ts_utc`
@@ -381,7 +385,7 @@ Accepted telemetry packets must include `i`, `et`, and `ts`. Type-specific optio
 - for `device_status`: `up`, `v`, `fw`, `r`, `hr`, `ss`, `dbg`
 - for `hub_status`: `up`, `fw`, `r`, `rf`, `seq`, `fs`, `rs`, `ms`
 
-The parser validates uptime, RSSI, voltage, sequence counters, and the expected list shape for `fs`, `rs`, and `ms`.
+The parser validates uptime, RSSI, voltage, sequence counters, and the expected list shape for `rs` and `ms`. `fs` is accepted when present and treated as optional because the April 9, 2026 field test showed live `hub_status` packets without it.
 
 ### Invalid, rejected, and unknown classifications
 
@@ -1272,6 +1276,8 @@ The checked-in garden bridge supports these forwarded payload types:
 - `device_status`
 - `hub_status`
 
+On the UDP intake side it also understands `rapid_wind`, but uses it only to backfill wind fields into the next forwarded `obs_st` instead of forwarding `rapid_wind` over UART as its own message type.
+
 The controller applies these per-type forward intervals:
 
 - `obs_st`: 60 seconds
@@ -1283,6 +1289,13 @@ The controller applies these per-type forward intervals:
 It also enforces a global minimum 5-second gap between UART sends and uses a small priority queue that replaces the latest queued `obs_st`, `device_status`, and `hub_status` snapshot instead of stacking stale copies.
 
 This explains why the sender’s own debug counter or upstream packet cadence can drift from cloud observation counts.
+
+Field test note from April 9, 2026:
+
+- upstream live `obs_st` packets were 18 elements long rather than the older 22-element mock shape
+- upstream live `obs_st` packets frequently had `null` for indices `1` through `4`
+- upstream live stations emitted separate `rapid_wind` packets
+- upstream live `hub_status` packets were valid without `fs`
 
 ## 7.2 `msg_id` is generated on the sender side
 

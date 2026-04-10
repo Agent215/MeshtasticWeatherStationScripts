@@ -116,7 +116,7 @@ This section explicitly defines how each device communicates with the device imm
 | Tempest sensor \-\> Tempest hub | Vendor wireless radio link | WeatherFlow internal link | Bidirectional vendor-managed | No user configuration beyond normal Tempest setup | Treat as appliance behavior; not part of custom coding work. |
 | Tempest hub \<-\> garden router | 2.4 GHz Wi-Fi | IP over Wi-Fi | Hub joins LAN as client | Router provides local SSID and DHCP | Internet is not required for local UDP broadcast collection. |
 | Pico W \<-\> garden router | 2.4 GHz Wi-Fi | IP over Wi-Fi | Pico joins LAN as client | Same SSID/subnet as Tempest hub | Pico must be on the same local LAN as the hub to hear the UDP broadcasts. |
-| Tempest hub \-\> Pico W | Local LAN | UDP broadcast, JSON payloads | One-way broadcast from hub | Listen on UDP port 50222; current bridge support includes `obs_st`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status` | Preferred source of weather data for the garden node. No cloud token required. |
+| Tempest hub \-\> Pico W | Local LAN | UDP broadcast, JSON payloads | One-way broadcast from hub | Listen on UDP port 50222; current bridge support includes `obs_st`, `rapid_wind`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status` | Preferred source of weather data for the garden node. No cloud token required. |
 | Pico W \<-\> garden Meshtastic node | 3-wire UART \+ shared ground | UART serial | Primarily Pico TX \-\> node RX; optional reverse path | 3.3 V logic, suggested 115200 baud, 8N1, connect TX\<-\>RX and GND\<-\>GND | Do not feed 5 V logic into the RAK UART pins. Power voltage and UART logic level are different concepts. |
 | Garden Meshtastic node \<-\> home Meshtastic node | LoRa radio via antennas | Meshtastic over LoRa | Bidirectional | Region: United States / US915; same primary channel and PSK on both nodes | Bench testing confirmed message exchange once region/channel matched. Node list metadata may lag even when messages pass. |
 | Home Meshtastic node \<-\> Raspberry Pi | USB-C cable | USB serial / Meshtastic host interface | Bidirectional | Use USB for both power and host communication | Recommended over Bluetooth for reliability and easier debugging. |
@@ -127,18 +127,26 @@ This section explicitly defines how each device communicates with the device imm
 
 ## 6.1 Tempest UDP packets consumed by the Pico
 
-Current script-backed note: the checked-in Pico bridge listens on UDP port `50222` and supports `obs_st`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`. The full `obs_st` array currently carries 22 values in this order: `epoch_s`, `wind_lull_ms`, `wind_avg_ms`, `wind_gust_ms`, `wind_dir_deg`, `wind_sample_interval_s`, `pressure_hpa`, `temp_c`, `humidity_pct`, `illuminance_lux`, `uv_index`, `solar_wm2`, `rain_mm`, `precip_type`, `lightning_km`, `lightning_count`, `battery_v`, `report_interval_min`, `local_day_rain_mm`, `nearcast_rain_mm`, `local_day_nearcast_rain_mm`, and `precip_analysis_type`.
+Current script-backed note: the checked-in Pico bridge listens on UDP port `50222` and supports `obs_st`, `rapid_wind`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`.
 
-The current bridge ignores `rapid_wind`; forwarded weather observations are built from `obs_st`.
+Field test on April 9, 2026 showed that the live station did not match the older 22-field assumption. The observed `obs_st` shape was 18 values:
+
+`epoch_s`, `null`, `null`, `null`, `null`, `wind_sample_or_report_marker`, `pressure_hpa`, `temp_c`, `humidity_pct`, `illuminance_lux`, `uv_index`, `solar_wm2`, `rain_mm`, `precip_type`, `lightning_km`, `lightning_count`, `battery_v`, `report_interval_min`
+
+The bridge now treats the missing wind fields as optional and backfills wind speed/direction from `rapid_wind` when available. `rapid_wind` is therefore no longer ignored by the garden bridge even though it is not forwarded as a separate UART message.
 
 | {  "type": "obs\_st",  "obs": \[\[ epoch\_s, wind\_lull\_ms, wind\_avg\_ms, wind\_gust\_ms, wind\_dir\_deg, wind\_sample\_interval\_s, pressure\_hpa, temp\_c, humidity\_pct, illuminance\_lux, uv\_index, solar\_wm2, rain\_mm, precip\_type, lightning\_km, lightning\_count, battery\_v, report\_interval\_min \]\]} |
 | :---- |
 
-Suggested MVP field extraction from obs\_st: timestamp, average wind, wind direction, pressure, temperature, humidity, and rain amount. The rapid\_wind packet can be used later if the site needs more frequent wind updates than the one-minute observation cadence.
+Suggested MVP field extraction from obs\_st: timestamp, pressure, temperature, humidity, and rain amount. For live stations that emit null wind slots in `obs_st`, use the latest `rapid_wind` packet to recover wind speed and direction.
 
 ## 6.2 Pico to Meshtastic payload format
 
-Current script-backed note: the Pico now sends one compact JSON object per UART line. The primary weather payload shape is `{"et":"obs_st","i":17,"ts":1741985112,"t":22.5,"h":52,"p":1011.4,"w":3.4,"g":5.2,"l":1.1,"d":230,"r":0.0,"uv":2.4,"sr":410.0,"lux":12500,"bat":2.48,"ld":0.0,"lc":0,"pt":0,"ri":1,"rd":0.0,"nr":0.0,"nrd":0.0,"pa":0}`.
+Current script-backed note: the Pico now sends one compact JSON object per UART line. The primary weather payload shape is `{"et":"obs_st","i":17,"ts":1741985112,"t":22.5,"h":52.0,"p":1011.4,"w":3.4,"g":5.2,"l":1.1,"d":230,"ws":60,"r":0.0,"uv":2.4,"sr":410.0,"lux":12500.0,"bat":2.48,"ld":0.0,"lc":0,"pt":0,"ri":1}`.
+
+After the April 9, 2026 field test, this payload should be interpreted as a normalized bridge output, not a literal mirror of the upstream UDP packet. The bridge may derive `w`, `g`, `l`, and `d` from the latest `rapid_wind` packet when the source `obs_st` contains `null` values in those positions.
+
+The bridge currently rounds continuous weather values to two decimal places before UART forwarding. Discrete counters and enum-like fields remain integers. Because JSON numbers do not retain formatting width, a value rounded to two decimals may still render as `22.5` instead of `22.50`.
 
 Other forwarded UART payloads use these field sets:
 
@@ -147,6 +155,8 @@ Other forwarded UART payloads use these field sets:
 * `device_status`: `et`, `i`, `ts`, `up`, `v`, `fw`, `r`, `hr`, `ss`, `dbg`  
 * `hub_status`: `et`, `i`, `ts`, `up`, `fw`, `r`, `rf`, `seq`, `fs`, `rs`, `ms`  
 * heartbeat/debug: `sys`, `i`, `up`, `ip`, `wc`, `pm`, `udp`, `jerr`, `unsup`, `rej`, `skip`, `qsz`, `qrepl`, `qdrop`, `fwd`, `sockrec`, `wifirec`, `sockerr`, `nwu`, `last_udp_s`, `last_obs_s`, `last_ok_s`
+
+`fs` is optional in live `hub_status` traffic and should be treated as nullable.
 
 | {  "msg\_id": 12,  "ts": 1772841600,  "temp\_c": 22.4,  "hum": 55,  "pres\_hpa": 1012.7,  "wind\_ms": 3.1,  "wind\_dir": 245,  "rain\_mm": 0.0} |
 | :---- |

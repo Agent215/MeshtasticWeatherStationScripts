@@ -6,3 +6,21 @@
 6. Final check: hub + Pico on same subnet, Pico receiving UDP 50222.
 
 Extra reminder: keep your laptop on Wi-Fi only while testing; unplug Ethernet/VPN.
+
+Field test results from April 9, 2026:
+
+- Live `obs_st` packets arrived as 18-value arrays, not the older 22-value mock shape.
+- In the live `obs_st` payload, indices 1 through 4 were often `null`.
+- Live wind data arrived separately as `rapid_wind` with `ob=[timestamp, speed_mps, direction_deg]`.
+- Live `hub_status` packets were valid without `fs`.
+
+Observed live payload examples:
+
+obs_st
+{"serial_number":"ST-00202901","type":"obs_st","hub_sn":"HB-00204613","obs":[[1775778195,null,null,null,null,60,1030.52,14.0,45.41,778,0.08,6,0.103412,1,0,0,2.189,1]],"firmware_revision":185}
+
+rapid_wind
+{"serial_number":"ST-00202901","type":"rapid_wind","hub_sn":"HB-00204613","ob":[1775778196,0.0,0]}
+
+hub_status
+{"serial_number":"HB-00204613","type":"hub_status","firmware_revision":"309","uptime":2100,"rssi":-34,"timestamp":1775776806,"reset_flags":"POR","seq":209,"radio_stats":[28,1,0,2,1466],"mqtt_stats":[0,170],"freq":902000000,"hw_version":2,"hardware_id":0}

@@ -3,7 +3,7 @@
 Listen for Tempest-style UDP packets and validate supported payload shapes.
 
 This test utility accepts the Tempest packet types used by the project:
-`obs_st`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`.
+`obs_st`, `rapid_wind`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`.
 Each received packet is parsed as JSON, validated for the expected structure,
 and logged as either valid or invalid with enough detail to troubleshoot the
 payload quickly.
@@ -20,7 +20,7 @@ import logging
 import socket
 from typing import Any, Callable, Dict, Optional, Tuple
 
-OBS_ST_FIELD_COUNT = 22
+OBS_ST_FIELD_COUNT = 18
 
 
 def missing_required_keys(message: Dict[str, Any], required_keys: Tuple[str, ...]) -> Optional[str]:
@@ -51,6 +51,26 @@ def validate_obs_st(message: Dict[str, Any]) -> Optional[str]:
             return f"obs[{index}] must be a list"
         if len(entry) != OBS_ST_FIELD_COUNT:
             return f"obs[{index}] expected {OBS_ST_FIELD_COUNT} values, got {len(entry)}"
+        if not is_number(entry[0]):
+            return f"obs[{index}][0] must be a numeric timestamp"
+
+    return None
+
+
+def validate_rapid_wind(message: Dict[str, Any]) -> Optional[str]:
+    error = missing_required_keys(message, ("serial_number", "hub_sn", "ob"))
+    if error:
+        return error
+
+    ob = message["ob"]
+    if not isinstance(ob, list) or len(ob) < 3:
+        return "ob must be a list with at least 3 values"
+    if not is_number(ob[0]):
+        return "ob[0] must be a numeric timestamp"
+    if not is_number(ob[1]):
+        return "ob[1] must be a numeric wind speed"
+    if not is_number(ob[2]):
+        return "ob[2] must be a numeric wind direction"
 
     return None
 
@@ -133,7 +153,6 @@ def validate_hub_status(message: Dict[str, Any]) -> Optional[str]:
             "rssi",
             "reset_flags",
             "seq",
-            "fs",
             "radio_stats",
             "mqtt_stats",
         ),
@@ -146,16 +165,20 @@ def validate_hub_status(message: Dict[str, Any]) -> Optional[str]:
         if not is_number(message[field]):
             return f"{field} must be numeric"
 
-    list_fields = ("fs", "radio_stats", "mqtt_stats")
+    list_fields = ("radio_stats", "mqtt_stats")
     for field in list_fields:
         if not isinstance(message[field], list):
             return f"{field} must be a list"
+
+    if "fs" in message and not isinstance(message["fs"], list):
+        return "fs must be a list when present"
 
     return None
 
 
 PACKET_VALIDATORS: Dict[str, Callable[[Dict[str, Any]], Optional[str]]] = {
     "obs_st": validate_obs_st,
+    "rapid_wind": validate_rapid_wind,
     "evt_precip": validate_evt_precip,
     "evt_strike": validate_evt_strike,
     "device_status": validate_device_status,
@@ -174,6 +197,12 @@ def summarize_packet(message: Dict[str, Any]) -> str:
 
     if packet_type == "obs_st":
         return f"{prefix}, count={len(message['obs'])}"
+
+    if packet_type == "rapid_wind":
+        return (
+            f"{prefix}, ts={int(message['ob'][0])}, "
+            f"speed_mps={message['ob'][1]}, dir_deg={message['ob'][2]}"
+        )
 
     if packet_type == "evt_precip":
         return f"{prefix}, ts={int(message['evt'][0])}"

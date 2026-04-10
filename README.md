@@ -43,7 +43,7 @@ The primary production reference is [`docs/architecture/weather_station_mvp_arch
 - [`aws/packaged-template.yaml`](./aws/packaged-template.yaml): packaged CloudFormation template
 - [`swagger.yml`](./swagger.yml): OpenAPI description for the current AWS HTTP API
 - [`mocks/mock_tempest_udp_sender.py`](./mocks/mock_tempest_udp_sender.py): mock Tempest `obs_st` UDP sender
-- [`mocks/mock_tempest_udp_sender_extended.py`](./mocks/mock_tempest_udp_sender_extended.py): mock Tempest sender for `obs_st`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`
+- [`mocks/mock_tempest_udp_sender_extended.py`](./mocks/mock_tempest_udp_sender_extended.py): mock Tempest sender for `obs_st`, `rapid_wind`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`
 - [`mocks/ecowitt_mock_server_v3.py`](./mocks/ecowitt_mock_server_v3.py): mock Ecowitt LAN API server for local integration work
 - [`docs/systemd/README.md`](./docs/systemd/README.md): reference notes for the retention `systemd` units used on the home server
 - [`docs/systemd/weatherstation-db-retention.service`](./docs/systemd/weatherstation-db-retention.service): reference copy of the live retention service unit
@@ -60,8 +60,9 @@ The primary production reference is [`docs/architecture/weather_station_mvp_arch
 It does the following:
 
 - connects to local Wi-Fi and listens for Tempest-style UDP packets on port `50222`
-- supports `obs_st`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`
+- supports `obs_st`, `rapid_wind`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`
 - validates payload structure, sanity-checks supported field ranges, and rounds weather values before forwarding
+- caches `rapid_wind` speed/direction and uses that data to backfill the next `obs_st` when the live station omits wind fields
 - forwards compact newline-delimited JSON over UART at `115200` baud
 - uses `GP0` for TX and `GP1` for RX
 - applies per-type forwarding throttles:
@@ -81,7 +82,26 @@ It does the following:
 Current `obs_st` UART payload shape:
 
 ```json
-{"et":"obs_st","i":17,"ts":1741985112,"t":22.5,"h":52,"p":1011.4,"w":3.4,"g":5.2,"l":1.1,"d":230,"r":0.0,"uv":2.4,"sr":410.0,"lux":12500,"bat":2.48,"ld":0.0,"lc":0,"pt":0,"ri":1,"rd":0.0,"nr":0.0,"nrd":0.0,"pa":0}
+{"et":"obs_st","i":17,"ts":1741985112,"t":22.5,"h":52.0,"p":1011.4,"w":3.4,"g":5.2,"l":1.1,"d":230,"ws":60,"r":0.0,"uv":2.4,"sr":410.0,"lux":12500.0,"bat":2.48,"ld":0.0,"lc":0,"pt":0,"ri":1}
+```
+
+April 9, 2026 field-test note:
+
+- live `obs_st` packets arrived with 18 values, not 22
+- live `obs_st` often had `null` for indices `1` through `4`, so wind lull/avg/gust/direction were not present in that packet
+- live stations emitted separate `rapid_wind` packets as `{"type":"rapid_wind","ob":[ts,speed_mps,dir_deg]}`
+- live `hub_status` packets sometimes omitted `fs`
+
+One observed live `obs_st` payload shape was:
+
+```json
+{"serial_number":"ST-00202901","type":"obs_st","hub_sn":"HB-00204613","obs":[[1775778195,null,null,null,null,60,1030.52,14.0,45.41,778,0.08,6,0.103412,1,0,0,2.189,1]],"firmware_revision":185}
+```
+
+One observed live `rapid_wind` payload shape was:
+
+```json
+{"serial_number":"ST-00202901","type":"rapid_wind","hub_sn":"HB-00204613","ob":[1775778196,0.0,0]}
 ```
 
 Other forwarded UART payload types use these field sets:
@@ -90,6 +110,16 @@ Other forwarded UART payload types use these field sets:
 - `evt_strike`: `et`, `i`, `ts`, `ld`, `se`
 - `device_status`: `et`, `i`, `ts`, `up`, `v`, `fw`, `r`, `hr`, `ss`, `dbg`
 - `hub_status`: `et`, `i`, `ts`, `up`, `fw`, `r`, `rf`, `seq`, `fs`, `rs`, `ms`
+
+`fs` remains part of the forwarded `hub_status` payload when present, but the bridge and listener now treat it as optional because the live station did not include it on April 9, 2026.
+
+Fields such as `rd`, `nr`, `nrd`, and `pa` are not part of the official local UDP `obs_st` v171 payload. If a future upstream source provides them, the bridge can forward them, but the current live UDP path should treat them as absent by default.
+
+Current bridge rounding policy:
+
+- continuous weather values are rounded to two decimal places before UART forwarding
+- timestamps, wind direction, strike counts, precipitation type, report interval, and similar counters remain integers
+- JSON output does not preserve trailing zero formatting, so a value rounded to two decimals may appear as `22.5` instead of `22.50`
 
 Current heartbeat payload shape:
 
@@ -208,7 +238,7 @@ Pico GND      -> RAK GND
 
 ### Mock testing
 
-Send basic `obs_st` Tempest-style UDP packets to the Pico:
+Send basic live-shape Tempest-style UDP packets to the Pico:
 
 ```powershell
 python .\mocks\mock_tempest_udp_sender.py --target 192.168.1.205 --interval 10

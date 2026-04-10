@@ -4,12 +4,13 @@ Send a realistic stream of mock Tempest UDP packets for local testing.
 
 This simulator maintains evolving station and hub state, then emits the same
 mix of messages a Tempest installation would normally produce: periodic
-`obs_st`, `device_status`, and `hub_status` packets, plus `evt_precip` when
-rain starts and `evt_strike` when a simulated lightning event occurs. Command
-line flags control the target address, port, send intervals, loop tick, and
-lightning frequency. Each loop iteration checks which message types are due,
-updates the synthetic weather model for new observations, sends JSON over UDP,
-and prints the payload so runs are easy to inspect.
+`obs_st`, `rapid_wind`, `device_status`, and `hub_status` packets, plus
+`evt_precip` when rain starts and `evt_strike` when a simulated lightning
+event occurs. Command line flags control the target address, port, send
+intervals, loop tick, and lightning frequency. Each loop iteration checks
+which message types are due, updates the synthetic weather model for new
+observations, sends JSON over UDP, and prints the payload so runs are easy to
+inspect.
 
 you can pass `--target` to a Pico's IP for unicast testing, or use `--target 192.168.8.105` for example, or use `--target 192.168.8.105`
 """
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 
 UDP_PORT = 50222
 DEFAULT_OBS_INTERVAL_SEC = 60
+DEFAULT_RAPID_WIND_INTERVAL_SEC = 3
 DEFAULT_DEVICE_STATUS_INTERVAL_SEC = 60
 DEFAULT_HUB_STATUS_INTERVAL_SEC = 10
 DEFAULT_TICK_SEC = 1.0
@@ -147,11 +149,11 @@ def clamp(value: float, lower: float, upper: float) -> float:
 def build_obs_st(state: SimulatorState, wx: dict) -> dict:
     obs = [[
         wx["timestamp"],
-        wx["wind_lull"],
-        wx["wind_avg"],
-        wx["wind_gust"],
-        wx["wind_dir"],
-        wx["wind_sample_interval"],
+        None,
+        None,
+        None,
+        None,
+        60,
         wx["pressure_hpa"],
         wx["temp_c"],
         wx["humidity_pct"],
@@ -164,10 +166,6 @@ def build_obs_st(state: SimulatorState, wx: dict) -> dict:
         wx["lightning_strike_count"],
         wx["battery_v"],
         wx["report_interval_min"],
-        wx["local_day_rain_mm"],
-        wx["nearcast_rain_mm"],
-        wx["local_day_nearcast_rain_mm"],
-        wx["precip_analysis_type"],
     ]]
     return {
         "serial_number": state.station_sn,
@@ -175,6 +173,19 @@ def build_obs_st(state: SimulatorState, wx: dict) -> dict:
         "hub_sn": state.hub_sn,
         "obs": obs,
         "firmware_revision": state.firmware_revision,
+    }
+
+
+def build_rapid_wind(state: SimulatorState, wx: dict) -> dict:
+    return {
+        "serial_number": state.station_sn,
+        "type": "rapid_wind",
+        "hub_sn": state.hub_sn,
+        "ob": [
+            wx["timestamp"],
+            wx["wind_avg"],
+            wx["wind_dir"],
+        ],
     }
 
 
@@ -218,7 +229,7 @@ def build_device_status(state: SimulatorState) -> dict:
 
 def build_hub_status(state: SimulatorState) -> dict:
     state.hub_seq += 1
-    return {
+    packet = {
         "serial_number": state.hub_sn,
         "type": "hub_status",
         "firmware_revision": state.hub_firmware_revision,
@@ -227,10 +238,12 @@ def build_hub_status(state: SimulatorState) -> dict:
         "timestamp": int(time.time()),
         "reset_flags": "PIN,SFT",
         "seq": state.hub_seq,
-        "fs": [1, 0, 15675411, 524288],
         "radio_stats": [25, 1, 0, 3, random.randint(1000, 65000)],
         "mqtt_stats": [random.randint(0, 150), random.randint(0, 10)],
     }
+    if random.random() < 0.15:
+        packet["fs"] = [1, 0, 15675411, 524288]
+    return packet
 
 
 def make_socket(broadcast: bool) -> socket.socket:
@@ -272,6 +285,12 @@ def main() -> None:
         help="Seconds between obs_st packets. Default 60.",
     )
     parser.add_argument(
+        "--rapid-wind-interval",
+        type=float,
+        default=DEFAULT_RAPID_WIND_INTERVAL_SEC,
+        help="Seconds between rapid_wind packets. Default 3.",
+    )
+    parser.add_argument(
         "--device-status-interval",
         type=float,
         default=DEFAULT_DEVICE_STATUS_INTERVAL_SEC,
@@ -296,13 +315,16 @@ def main() -> None:
     state = SimulatorState()
 
     last_obs_at = 0.0
+    last_rapid_wind_at = 0.0
     last_device_status_at = 0.0
     last_hub_status_at = 0.0
     previous_raining = False
+    last_weather = state.evolve_weather(args.strike_chance)
 
     print(
         f"Sending mock Tempest UDP packets to {args.target}:{args.port} "
         f"(obs_st every {args.obs_interval}s, "
+        f"rapid_wind every {args.rapid_wind_interval}s, "
         f"device_status every {args.device_status_interval}s, "
         f"hub_status every {args.hub_status_interval}s)",
         flush=True,
@@ -321,18 +343,24 @@ def main() -> None:
                     send_packet(sock, args.target, args.port, build_device_status(state))
                     last_device_status_at = now_monotonic
 
-                if now_monotonic - last_obs_at >= args.obs_interval:
-                    wx = state.evolve_weather(args.strike_chance)
-                    send_packet(sock, args.target, args.port, build_obs_st(state, wx))
+                if now_monotonic - last_rapid_wind_at >= args.rapid_wind_interval:
+                    last_weather = state.evolve_weather(args.strike_chance)
+                    send_packet(sock, args.target, args.port, build_rapid_wind(state, last_weather))
+                    last_rapid_wind_at = now_monotonic
 
-                    raining_now = wx["rain_interval_mm"] > 0
+                if now_monotonic - last_obs_at >= args.obs_interval:
+                    if now_monotonic - last_rapid_wind_at > 0.5:
+                        last_weather = state.evolve_weather(args.strike_chance)
+                    send_packet(sock, args.target, args.port, build_obs_st(state, last_weather))
+
+                    raining_now = last_weather["rain_interval_mm"] > 0
                     if raining_now and not previous_raining:
-                        send_packet(sock, args.target, args.port, build_evt_precip(state, wx))
+                        send_packet(sock, args.target, args.port, build_evt_precip(state, last_weather))
                     previous_raining = raining_now
 
-                    if wx["lightning_strike_count"] > 0:
-                        for _ in range(wx["lightning_strike_count"]):
-                            send_packet(sock, args.target, args.port, build_evt_strike(state, wx))
+                    if last_weather["lightning_strike_count"] > 0:
+                        for _ in range(last_weather["lightning_strike_count"]):
+                            send_packet(sock, args.target, args.port, build_evt_strike(state, last_weather))
 
                     last_obs_at = now_monotonic
             except OSError:

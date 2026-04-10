@@ -1,0 +1,74 @@
+2026-04-09 19:42:49,978 [INFO] Listening for Tempest UDP packets on port 50222...
+2026-04-09 19:42:58,520 [INFO] Valid hub_status from ('192.168.8.157', 54985): serial=HB-00204613, ts=1775778156, seq=344
+2026-04-09 19:42:58,527 [INFO] Valid hub_status from ('192.168.8.157', 54985): serial=HB-00204613, ts=1775778156, seq=344
+2026-04-09 19:43:08,489 [INFO] Valid hub_status from ('192.168.8.157', 54986): serial=HB-00204613, ts=1775778166, seq=345
+2026-04-09 19:43:08,494 [INFO] Valid hub_status from ('192.168.8.157', 54986): serial=HB-00204613, ts=1775778166, seq=345
+2026-04-09 19:43:18,491 [INFO] Valid hub_status from ('192.168.8.157', 54987): serial=HB-00204613, ts=1775778176, seq=346
+2026-04-09 19:43:18,494 [INFO] Valid hub_status from ('192.168.8.157', 54987): serial=HB-00204613, ts=1775778176, seq=346
+2026-04-09 19:43:28,524 [INFO] Valid hub_status from ('192.168.8.157', 54988): serial=HB-00204613, ts=1775778186, seq=347
+2026-04-09 19:43:28,530 [INFO] Valid hub_status from ('192.168.8.157', 54988): serial=HB-00204613, ts=1775778186, seq=347
+2026-04-09 19:43:37,540 [INFO] Valid device_status from ('192.168.8.157', 54989): serial=ST-00202901, hub=HB-00204613, ts=1775778195, uptime=23398, voltage=2.188
+2026-04-09 19:43:37,541 [INFO] Valid device_status from ('192.168.8.157', 54989): serial=ST-00202901, hub=HB-00204613, ts=1775778195, uptime=23398, voltage=2.188
+2026-04-09 19:43:38,698 [INFO] Valid obs_st from ('192.168.8.157', 54990): serial=ST-00202901, hub=HB-00204613, count=1
+2026-04-09 19:43:38,700 [INFO] Valid obs_st from ('192.168.8.157', 54990): serial=ST-00202901, hub=HB-00204613, count=1
+2026-04-09 19:43:38,871 [INFO] Valid hub_status from ('192.168.8.157', 54991): serial=HB-00204613, ts=1775778196, seq=348
+2026-04-09 19:43:38,873 [INFO] Valid hub_status from ('192.168.8.157', 54991): serial=HB-00204613, ts=1775778196, seq=348
+2026-04-09 19:43:38,876 [INFO] Valid rapid_wind from ('192.168.8.157', 54992): serial=ST-00202901, hub=HB-00204613, ts=1775778196, speed_mps=0.0, dir_deg=0
+2026-04-09 19:43:38,876 [INFO] Valid rapid_wind from ('192.168.8.157', 54992): serial=ST-00202901, hub=HB-00204613, ts=1775778196, speed_mps=0.0, dir_deg=0
+2026-04-09 19:43:48,492 [INFO] Valid hub_status from ('192.168.8.157', 54993): serial=HB-00204613, ts=1775778206, seq=349
+2026-04-09 19:43:48,496 [INFO] Valid hub_status from ('192.168.8.157', 54993): serial=HB-00204613, ts=1775778206, seq=349
+2026-04-09 19:43:58,525 [INFO] Valid hub_status from ('192.168.8.157', 54994): serial=HB-00204613, ts=1775778216, seq=350
+2026-04-09 19:43:58,530 [INFO] Valid hub_status from ('192.168.8.157', 54994): serial=HB-00204613, ts=1775778216, seq=350
+2026-04-09 19:44:08,483 [INFO] Valid hub_status from ('192.168.8.157', 54995): serial=HB-00204613, ts=1775778226, seq=351
+2026-04-09 19:44:08,486 [INFO] Valid hub_status from ('192.168.8.157', 54995): serial=HB-00204613, ts=1775778226, seq=351
+2026-04-09 19:44:18,497 [INFO] Valid hub_status from ('192.168.8.157', 54996): serial=HB-00204613, ts=1775778236, seq=352
+2026-04-09 19:44:18,502 [INFO] Valid hub_status from ('192.168.8.157', 54996): serial=HB-00204613, ts=1775778236, seq=352
+2026-04-09 19:44:28,531 [INFO] Valid hub_status from ('192.168.8.157', 54997): serial=HB-00204613, ts=1775778246, seq=353
+2026-04-09 19:44:28,534 [INFO] Valid hub_status from ('192.168.8.157', 54997): serial=HB-00204613, ts=1775778246, seq=353
+2026-04-09 19:44:37,542 [INFO] Valid device_status from ('192.168.8.157', 54998): serial=ST-00202901, hub=HB-00204613, ts=1775778255, uptime=23458, voltage=2.188
+2026-04-09 19:44:37,545 [INFO] Valid device_status from ('192.168.8.157', 54998): serial=ST-00202901, hub=HB-00204613, ts=1775778255, uptime=23458, voltage=2.188
+2026-04-09 19:44:38,683 [INFO] Valid obs_st from ('192.168.8.157', 54999): serial=ST-00202901, hub=HB-00204613, count=1
+2026-04-09 19:44:38,685 [INFO] Valid obs_st from ('192.168.8.157', 54999): serial=ST-00202901, hub=HB-00204613, count=1
+2026-04-09 19:44:38,873 [INFO] Valid hub_status from ('192.168.8.157', 55000): serial=HB-00204613, ts=1775778256, seq=354
+2026-04-09 19:44:38,876 [INFO] Valid hub_status from ('192.168.8.157', 55000): serial=HB-00204613, ts=1775778256, seq=354
+2026-04-09 19:44:38,880 [INFO] Valid rapid_wind from ('192.168.8.157', 55001): serial=ST-00202901, hub=HB-00204613, ts=1775778256, speed_mps=0.0, dir_deg=0
+2026-04-09 19:44:38,880 [INFO] Valid rapid_wind from ('192.168.8.157', 55001): serial=ST-00202901, hub=HB-00204613, ts=1775778256, speed_mps=0.0, dir_deg=0
+2026-04-09 19:44:48,501 [INFO] Valid hub_status from ('192.168.8.157', 55002): serial=HB-00204613, ts=1775778266, seq=355
+2026-04-09 19:44:48,506 [INFO] Valid hub_status from ('192.168.8.157', 55002): serial=HB-00204613, ts=1775778266, seq=355
+2026-04-09 19:44:58,472 [INFO] Valid hub_status from ('192.168.8.157', 55003): serial=HB-00204613, ts=1775778276, seq=356
+2026-04-09 19:44:58,472 [INFO] Valid hub_status from ('192.168.8.157', 55003): serial=HB-00204613, ts=1775778276, seq=356
+2026-04-09 19:45:08,472 [INFO] Valid hub_status from ('192.168.8.157', 55004): serial=HB-00204613, ts=1775778286, seq=357
+2026-04-09 19:45:08,475 [INFO] Valid hub_status from ('192.168.8.157', 55004): serial=HB-00204613, ts=1775778286, seq=357
+2026-04-09 19:45:18,501 [INFO] Valid hub_status from ('192.168.8.157', 55005): serial=HB-00204613, ts=1775778296, seq=358
+2026-04-09 19:45:18,506 [INFO] Valid hub_status from ('192.168.8.157', 55005): serial=HB-00204613, ts=1775778296, seq=358
+2026-04-09 19:45:28,471 [INFO] Valid hub_status from ('192.168.8.157', 55006): serial=HB-00204613, ts=1775778306, seq=359
+2026-04-09 19:45:28,472 [INFO] Valid hub_status from ('192.168.8.157', 55006): serial=HB-00204613, ts=1775778306, seq=359
+2026-04-09 19:45:37,548 [INFO] Valid device_status from ('192.168.8.157', 55007): serial=ST-00202901, hub=HB-00204613, ts=1775778315, uptime=23518, voltage=2.187
+2026-04-09 19:45:37,551 [INFO] Valid device_status from ('192.168.8.157', 55007): serial=ST-00202901, hub=HB-00204613, ts=1775778315, uptime=23518, voltage=2.187
+2026-04-09 19:45:38,691 [INFO] Valid obs_st from ('192.168.8.157', 55008): serial=ST-00202901, hub=HB-00204613, count=1
+2026-04-09 19:45:38,691 [INFO] Valid obs_st from ('192.168.8.157', 55008): serial=ST-00202901, hub=HB-00204613, count=1
+2026-04-09 19:45:38,885 [INFO] Valid hub_status from ('192.168.8.157', 55009): serial=HB-00204613, ts=1775778316, seq=360
+2026-04-09 19:45:38,889 [INFO] Valid rapid_wind from ('192.168.8.157', 55010): serial=ST-00202901, hub=HB-00204613, ts=1775778316, speed_mps=0.0, dir_deg=0
+2026-04-09 19:45:38,889 [INFO] Valid rapid_wind from ('192.168.8.157', 55010): serial=ST-00202901, hub=HB-00204613, ts=1775778316, speed_mps=0.0, dir_deg=0
+2026-04-09 19:45:58,454 [INFO] Valid hub_status from ('192.168.8.157', 55011): serial=HB-00204613, ts=1775778336, seq=361
+2026-04-09 19:45:58,454 [INFO] Valid hub_status from ('192.168.8.157', 55011): serial=HB-00204613, ts=1775778336, seq=361
+2026-04-09 19:46:18,507 [INFO] Valid hub_status from ('192.168.8.157', 55012): serial=HB-00204613, ts=1775778356, seq=362
+2026-04-09 19:46:18,511 [INFO] Valid hub_status from ('192.168.8.157', 55012): serial=HB-00204613, ts=1775778356, seq=362
+2026-04-09 19:46:37,556 [INFO] Valid device_status from ('192.168.8.157', 55013): serial=ST-00202901, hub=HB-00204613, ts=1775778375, uptime=23578, voltage=2.191
+2026-04-09 19:46:37,561 [INFO] Valid device_status from ('192.168.8.157', 55013): serial=ST-00202901, hub=HB-00204613, ts=1775778375, uptime=23578, voltage=2.191
+2026-04-09 19:46:38,680 [INFO] Valid obs_st from ('192.168.8.157', 55014): serial=ST-00202901, hub=HB-00204613, count=1
+2026-04-09 19:46:38,683 [INFO] Valid obs_st from ('192.168.8.157', 55014): serial=ST-00202901, hub=HB-00204613, count=1
+2026-04-09 19:46:38,820 [INFO] Valid hub_status from ('192.168.8.157', 55015): serial=HB-00204613, ts=1775778376, seq=363
+2026-04-09 19:46:38,824 [INFO] Valid hub_status from ('192.168.8.157', 55015): serial=HB-00204613, ts=1775778376, seq=363
+2026-04-09 19:46:38,825 [INFO] Valid rapid_wind from ('192.168.8.157', 55016): serial=ST-00202901, hub=HB-00204613, ts=1775778376, speed_mps=0.0, dir_deg=0
+2026-04-09 19:46:38,827 [INFO] Valid rapid_wind from ('192.168.8.157', 55016): serial=ST-00202901, hub=HB-00204613, ts=1775778376, speed_mps=0.0, dir_deg=0
+2026-04-09 19:46:58,446 [INFO] Valid hub_status from ('192.168.8.157', 55017): serial=HB-00204613, ts=1775778396, seq=364
+2026-04-09 19:46:58,451 [INFO] Valid hub_status from ('192.168.8.157', 55017): serial=HB-00204613, ts=1775778396, seq=364
+2026-04-09 19:47:18,446 [INFO] Valid hub_status from ('192.168.8.157', 55018): serial=HB-00204613, ts=1775778416, seq=365
+2026-04-09 19:47:18,449 [INFO] Valid hub_status from ('192.168.8.157', 55018): serial=HB-00204613, ts=1775778416, seq=365
+2026-04-09 22:18:22,746 [INFO] Valid hub_status from ('192.168.1.208', 39278): serial=HB-TEST0001, ts=1775787481, seq=18782
+2026-04-09 22:18:22,746 [INFO] Valid device_status from ('192.168.1.208', 39278): serial=ST-TEST0001, hub=HB-TEST0001, ts=1775787481, uptime=80240, voltage=2.393
+2026-04-09 22:18:22,746 [INFO] Valid obs_st from ('192.168.1.208', 39278): serial=ST-TEST0001, hub=HB-TEST0001, count=1
+2026-04-09 22:18:22,747 [INFO] Valid evt_strike from ('192.168.1.208', 39278): serial=ST-TEST0001, hub=HB-TEST0001, ts=1775787481, distance_km=27, energy=5306
+2026-04-09 22:19:12,818 [INFO] Valid hub_status from ('192.168.1.208', 39278): serial=HB-TEST0001, ts=1775787531, seq=18787
+2026-04-09 22:21:46,943 [INFO] Listener stopped by user

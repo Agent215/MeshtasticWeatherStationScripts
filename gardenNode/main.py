@@ -10,6 +10,7 @@ from machine import Pin, UART
 #
 # Supports:
 #   - obs_st
+#   - rapid_wind (used to backfill wind data when obs_st omits it)
 #   - evt_precip
 #   - evt_strike
 #   - device_status
@@ -24,8 +25,8 @@ from machine import Pin, UART
 # ----------------------------
 # User settings
 # ----------------------------
-WIFI_SSID = "YOUR_WIFI_NAME"
-WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
+WIFI_SSID = "YOUR_WIFI_HERE"
+WIFI_PASSWORD = "YOUR_PASSWORD_HERE"
 
 UDP_PORT = 50222
 
@@ -107,6 +108,7 @@ socket_error_count = 0
 last_any_udp_tick_ms = None
 last_obs_st_tick_ms = None
 last_valid_weather_tick_ms = None
+last_rapid_wind = None
 
 # Track last successful FORWARD per supported kind
 last_forward_by_kind_ms = {}
@@ -503,28 +505,68 @@ def maybe_send_next_queued():
 # Weather / event parsing
 # ----------------------------
 def round_weather_fields(obs):
+    global last_rapid_wind
+
+    def obs_value(index, default=None):
+        if index >= len(obs):
+            return default
+        value = obs[index]
+        if value is None:
+            return default
+        return value
+
+    def round_two(value):
+        return round(float(value), 2)
+
+    def optional_float(index):
+        value = obs_value(index)
+        if value is None:
+            return None
+        return round_two(value)
+
+    def optional_int(index):
+        value = obs_value(index)
+        if value is None:
+            return None
+        return int(round(float(value)))
+
+    wind_speed = obs_value(2)
+    wind_direction = obs_value(4)
+
+    if last_rapid_wind is not None:
+        if wind_speed is None:
+            wind_speed = last_rapid_wind["w"]
+        if wind_direction is None:
+            wind_direction = last_rapid_wind["d"]
+
+    if wind_speed is None:
+        wind_speed = 0
+    if wind_direction is None:
+        wind_direction = 0
+
     return {
         "ts": int(obs[0]),
-        "t": round(float(obs[7]), 1),
-        "h": int(round(float(obs[8]))),
-        "p": round(float(obs[6]), 1),
-        "w": round(float(obs[2]), 1),
-        "g": round(float(obs[3]), 1),
-        "l": round(float(obs[1]), 1),
-        "d": int(round(float(obs[4]))),
-        "r": round(float(obs[12]), 1),
-        "uv": round(float(obs[10]), 1),
-        "sr": round(float(obs[11]), 1),
-        "lux": int(round(float(obs[9]))),
-        "bat": round(float(obs[16]), 2),
-        "ld": round(float(obs[14]), 1),
-        "lc": int(round(float(obs[15]))),
-        "pt": int(round(float(obs[13]))),
-        "ri": int(round(float(obs[17]))),
-        "rd": round(float(obs[18]), 1),
-        "nr": round(float(obs[19]), 1),
-        "nrd": round(float(obs[20]), 1),
-        "pa": int(round(float(obs[21]))),
+        "t": round_two(obs_value(7, 0)),
+        "h": round_two(obs_value(8, 0)),
+        "p": round_two(obs_value(6, 0)),
+        "w": round_two(wind_speed),
+        "g": round_two(obs_value(3, wind_speed)),
+        "l": round_two(obs_value(1, wind_speed)),
+        "d": int(round(float(wind_direction))),
+        "ws": optional_int(5),
+        "r": round_two(obs_value(12, 0)),
+        "uv": round_two(obs_value(10, 0)),
+        "sr": round_two(obs_value(11, 0)),
+        "lux": round_two(obs_value(9, 0)),
+        "bat": round_two(obs_value(16, 0)),
+        "ld": round_two(obs_value(14, 0)),
+        "lc": int(round(float(obs_value(15, 0)))),
+        "pt": int(round(float(obs_value(13, 0)))),
+        "ri": int(round(float(obs_value(17, 0)))),
+        "rd": optional_float(18),
+        "nr": optional_float(19),
+        "nrd": optional_float(20),
+        "pa": optional_int(21),
     }
 
 
@@ -542,6 +584,8 @@ def weather_values_are_sane(w):
     if not (0 <= w["l"] <= 100):
         return False
     if not (0 <= w["d"] <= 360):
+        return False
+    if w["ws"] is not None and not (0 <= w["ws"] <= 120):
         return False
     if not (0 <= w["r"] <= 1000):
         return False
@@ -561,13 +605,13 @@ def weather_values_are_sane(w):
         return False
     if not (0 <= w["ri"] <= 60):
         return False
-    if not (0 <= w["rd"] <= 2000):
+    if w["rd"] is not None and not (0 <= w["rd"] <= 2000):
         return False
-    if not (0 <= w["nr"] <= 2000):
+    if w["nr"] is not None and not (0 <= w["nr"] <= 2000):
         return False
-    if not (0 <= w["nrd"] <= 2000):
+    if w["nrd"] is not None and not (0 <= w["nrd"] <= 2000):
         return False
-    if not (0 <= w["pa"] <= 10):
+    if w["pa"] is not None and not (0 <= w["pa"] <= 10):
         return False
     return True
 
@@ -633,7 +677,7 @@ def parse_obs_st(packet_obj):
         return None
 
     obs = obs_list[0]
-    if not isinstance(obs, list) or len(obs) < 22:
+    if not isinstance(obs, list) or len(obs) < 18:
         sanity_reject_count += 1
         return None
 
@@ -669,6 +713,27 @@ def parse_evt_precip(packet_obj):
         return p
     except Exception as e:
         print("evt_precip field parse error:", e)
+        sanity_reject_count += 1
+        return None
+
+
+def parse_rapid_wind(packet_obj):
+    global sanity_reject_count, last_rapid_wind
+
+    ob = packet_obj.get("ob")
+    if not isinstance(ob, list) or len(ob) < 3:
+        sanity_reject_count += 1
+        return None
+
+    try:
+        last_rapid_wind = {
+            "ts": int(ob[0]),
+            "w": round(float(ob[1]), 2),
+            "d": int(round(float(ob[2]))),
+        }
+        return last_rapid_wind
+    except Exception as e:
+        print("rapid_wind field parse error:", e)
         sanity_reject_count += 1
         return None
 
@@ -757,6 +822,10 @@ def parse_supported_packet(packet_obj):
     if packet_type == "obs_st":
         return "obs_st", parse_obs_st(packet_obj)
 
+    if packet_type == "rapid_wind":
+        parse_rapid_wind(packet_obj)
+        return None, None
+
     if packet_type == "evt_precip":
         return "evt_precip", parse_evt_precip(packet_obj)
 
@@ -805,6 +874,7 @@ def send_obs_st_to_rak(weather):
         "g": weather["g"],
         "l": weather["l"],
         "d": weather["d"],
+        "ws": weather["ws"],
         "r": weather["r"],
         "uv": weather["uv"],
         "sr": weather["sr"],
@@ -814,11 +884,16 @@ def send_obs_st_to_rak(weather):
         "lc": weather["lc"],
         "pt": weather["pt"],
         "ri": weather["ri"],
-        "rd": weather["rd"],
-        "nr": weather["nr"],
-        "nrd": weather["nrd"],
-        "pa": weather["pa"],
     }
+
+    if weather["rd"] is not None:
+        payload["rd"] = weather["rd"]
+    if weather["nr"] is not None:
+        payload["nr"] = weather["nr"]
+    if weather["nrd"] is not None:
+        payload["nrd"] = weather["nrd"]
+    if weather["pa"] is not None:
+        payload["pa"] = weather["pa"]
 
     uart_send_json(payload)
     msg_id += 1
