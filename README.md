@@ -27,7 +27,7 @@ The primary production reference is [`docs/architecture/weather_station_mvp_arch
 - [`weatherstation/listen_meshtastic.py`](./weatherstation/listen_meshtastic.py): production home-side Meshtastic ingest process
 - [`weatherstation/parser.py`](./weatherstation/parser.py): parser/classifier for weather, health, event, telemetry, invalid, rejected, and unknown packets
 - [`weatherstation/storage.py`](./weatherstation/storage.py): SQLite write path and AWS queue state transitions
-- [`weatherstation/app_config.py`](./weatherstation/app_config.py): shared `.env` and environment-variable loader used by the listener, queue worker, and retention job
+- [`weatherstation/app_config.py`](./weatherstation/app_config.py): shared environment-setting helpers used by the home-side processes; the queue worker and retention job use it to load the app env file
 - [`weatherstation/db.py`](./weatherstation/db.py): SQLite connection helper with `WEATHERSTATION_DB_PATH` override support
 - [`weatherstation/schema.sql`](./weatherstation/schema.sql): production home-side SQLite schema
 - [`weatherstation/queue_worker.py`](./weatherstation/queue_worker.py): production AWS delivery worker
@@ -42,6 +42,7 @@ The primary production reference is [`docs/architecture/weather_station_mvp_arch
 - [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml): source CloudFormation template
 - [`aws/packaged-template.yaml`](./aws/packaged-template.yaml): packaged CloudFormation template
 - [`swagger.yml`](./swagger.yml): OpenAPI description for the current AWS HTTP API
+- [`route-settings.json`](./route-settings.json): current API Gateway route throttling overrides for the read endpoints
 - [`mocks/mock_tempest_udp_sender.py`](./mocks/mock_tempest_udp_sender.py): mock Tempest `obs_st` UDP sender
 - [`mocks/mock_tempest_udp_sender_extended.py`](./mocks/mock_tempest_udp_sender_extended.py): mock Tempest sender for `obs_st`, `rapid_wind`, `evt_precip`, `evt_strike`, `device_status`, and `hub_status`
 - [`mocks/ecowitt_mock_server_v3.py`](./mocks/ecowitt_mock_server_v3.py): mock Ecowitt LAN API server for local integration work
@@ -184,7 +185,7 @@ Additional hardware notes that matter in practice:
 
 [`scripts/home/meshtastic_debug_logger.py`](./scripts/home/meshtastic_debug_logger.py) is a standalone home-side Meshtastic debug logger. It connects to a Meshtastic node over USB serial, emits structured JSON logs for packet/text/connection events, and automatically reconnects if the serial link drops. It is useful for link bring-up and troubleshooting because it does not parse payloads or write to SQLite. It uses the `MESHTASTIC_DEVICE` environment variable to target a specific serial device.
 
-[`weatherstation/listen_meshtastic.py`](./weatherstation/listen_meshtastic.py) is the production ingest entry point. It parses inbound text packets, stores accepted `obs_st` weather rows in SQLite, records `sys` heartbeat/debug packets in `device_health_events`, stores `evt_precip` and `evt_strike` in `weather_events`, stores `device_status` and `hub_status` in `device_telemetry_events`, and updates `device_status_current`. It now also supports a packet-flow watchdog with `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC`.
+[`weatherstation/listen_meshtastic.py`](./weatherstation/listen_meshtastic.py) is the production ingest entry point. It parses inbound text packets, stores accepted `obs_st` weather rows in SQLite, records `sys` heartbeat/debug packets in `device_health_events`, stores `evt_precip` and `evt_strike` in `weather_events`, stores `device_status` and `hub_status` in `device_telemetry_events`, and updates `device_status_current`. It also supports a packet-flow watchdog with `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC`, all read from the process environment.
 
 [`weatherstation/queue_worker.py`](./weatherstation/queue_worker.py) drains `aws_delivery_queue` into the AWS ingest API. It reads `API_URL` and `API_KEY` through [`weatherstation/app_config.py`](./weatherstation/app_config.py), which prefers `~/weatherstation-home/.env`, supports `WEATHERSTATION_ENV_PATH`, and falls back to `/etc/weatherstation-home.env` when present. [`weatherstation/db.py`](./weatherstation/db.py) now exposes the default database path `~/weatherstation-home/weatherstation/weatherstation.db` and allows overriding it with `WEATHERSTATION_DB_PATH`.
 
@@ -272,8 +273,13 @@ python .\mocks\ecowitt_mock_server_v3.py --host 127.0.0.1 --port 8080
 
 1. Deploy the [`weatherstation/`](./weatherstation) files to the Raspberry Pi under `~/weatherstation-home/weatherstation/` or an equivalent layout.
 2. Initialize the SQLite database once from [`weatherstation/schema.sql`](./weatherstation/schema.sql).
-3. Create `~/weatherstation-home/.env` with `API_URL=...` and `API_KEY=...`, or use `/etc/weatherstation-home.env`, or point the processes at a different file with `WEATHERSTATION_ENV_PATH`.
-4. Set `MESHTASTIC_DEVICE` if you want to target a specific serial path for [`weatherstation/listen_meshtastic.py`](./weatherstation/listen_meshtastic.py). Optional listener controls are `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC`.
+
+```bash
+sqlite3 ~/weatherstation-home/weatherstation/weatherstation.db < ~/weatherstation-home/weatherstation/schema.sql
+```
+
+3. Create `~/weatherstation-home/.env` with `API_URL=...` and `API_KEY=...` for [`weatherstation/queue_worker.py`](./weatherstation/queue_worker.py) and [`weatherstation/retention.py`](./weatherstation/retention.py), or use `/etc/weatherstation-home.env`, or point the process at a different file with `WEATHERSTATION_ENV_PATH`.
+4. Set `MESHTASTIC_DEVICE` if you want to target a specific serial path for [`weatherstation/listen_meshtastic.py`](./weatherstation/listen_meshtastic.py). Optional listener controls are `MESHTASTIC_WATCHDOG_ENABLED`, `MESHTASTIC_WATCHDOG_TIMEOUT_SEC`, and `MESHTASTIC_RECONNECT_DELAY_SEC`. Set these in the shell, service unit, or other process environment used to launch the listener.
 5. If the SQLite file is not stored at `~/weatherstation-home/weatherstation/weatherstation.db`, set `WEATHERSTATION_DB_PATH`.
 6. Optional retention controls are `DB_RETENTION_ENABLED`, `DB_RETENTION_DAYS`, `DB_RETENTION_BATCH_SIZE`, and `DB_RETENTION_MAX_BATCHES`.
 7. Run the listener and queue worker as separate long-lived processes:
@@ -309,6 +315,8 @@ Deploy [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml) or [
 - `ApiSharedSecret`
 - `TableName`
 - `AllowedCorsOrigin`
+
+Current read-path throttle overrides for API Gateway are captured in [`route-settings.json`](./route-settings.json).
 
 ## Documentation
 
