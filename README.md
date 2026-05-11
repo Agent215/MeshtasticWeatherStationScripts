@@ -2,8 +2,11 @@
 
 This repository contains the current weather-station MVP documentation plus the code artifacts that support the garden bridge, the full home-server ingest pipeline, the AWS APIs, and local test tooling.
 
-The production system is a store-and-forward pipeline:
 
+## System Architecture  
+<img width="2000" height="1270" alt="meshtastic_weather_architecture_v2_numbered" src="https://github.com/user-attachments/assets/e5928f69-ceed-4a09-a4f9-be50fdff60b9" />
+
+The production system is a store-and-forward pipeline:
 `weather source -> garden bridge -> Meshtastic -> home Raspberry Pi -> SQLite backlog -> AWS ingest API -> DynamoDB -> read APIs`
 
 The primary production reference is [`docs/architecture/weather_station_mvp_architecture_and_schema.md`](./docs/architecture/weather_station_mvp_architecture_and_schema.md). That document describes the current home-server schema, queueing model, retention behavior, AWS stack, and DynamoDB data model. The checked-in code in this repository now includes the garden bridge, the full `weatherstation/` listener/parser/storage/queue-worker pipeline, the shared home-server config loader, the SQLite retention job, the standalone Meshtastic listener utility, the AWS Lambda handlers, and mocks/test utilities.
