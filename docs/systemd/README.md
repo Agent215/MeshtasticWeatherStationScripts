@@ -12,6 +12,14 @@ The active environment file on the server is:
 
 - `/etc/weatherstation-home.env`
 
+The current reference units in this folder are configured to:
+
+- run `weatherstation-db-retention.service` daily at `03:17` local time
+- apply `RandomizedDelaySec=15m` with `Persistent=true`
+- execute as user/group `gardener`
+- use `/home/gardener/weatherstation-home/weatherstation` as the working directory
+- run `/home/gardener/weatherstation-home/.venv/bin/python /home/gardener/weatherstation-home/weatherstation/retention.py`
+
 Use these commands on the server to inspect the installed units:
 
 ```bash
