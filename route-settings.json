@@ -6,5 +6,17 @@
   "GET /observations": {
     "ThrottlingBurstLimit": 7,
     "ThrottlingRateLimit": 2
+  },
+  "POST /observations/exports": {
+    "ThrottlingBurstLimit": 2,
+    "ThrottlingRateLimit": 1
+  },
+  "GET /observations/exports/{jobId}": {
+    "ThrottlingBurstLimit": 5,
+    "ThrottlingRateLimit": 2
+  },
+  "DELETE /observations/exports/{jobId}": {
+    "ThrottlingBurstLimit": 2,
+    "ThrottlingRateLimit": 1
   }
 }

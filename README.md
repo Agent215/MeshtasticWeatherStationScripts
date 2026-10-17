@@ -22,7 +22,7 @@ The primary production reference is [`docs/architecture/weather_station_mvp_arch
 - Garden-side Tempest-style weather packets are received over local UDP, normalized on the Pico, and forwarded over UART into a Meshtastic node.
 - The home side is the durable ingest point in production: accepted packets are stored in SQLite, queued for AWS delivery, and retried until they succeed.
 - AWS stores historical observations and a latest snapshot in DynamoDB behind API Gateway and Lambda.
-- System-wide weather identity is timestamp-based: `(source_node_id, source_ts_utc)`.
+- Home-side SQLite dedupe remains timestamp-based at `(source_node_id, source_ts_utc)`. Cloud history keeps that source-time prefix in primary keys, but adds `received_at_utc` and `msg_id` so a station clock rollback cannot overwrite a distinct packet. Dashboard time ranges use the separate display-time index.
 
 ## Repository Layout
 
@@ -196,8 +196,8 @@ Additional hardware notes that matter in practice:
 
 The AWS side in this repository matches the production design:
 
-- [`aws/ingest/app.py`](./aws/ingest/app.py) accepts `POST /observations`, requires the `x-weatherstation-key` header, normalizes `source_ts_utc` and `received_at_utc` from ISO-8601 or epoch input, validates known `weather` fields, writes history rows idempotently, and only advances the `LATEST` snapshot when the incoming observation is newer.
-- [`aws/read/app.py`](./aws/read/app.py) serves `GET /observations/latest?stationId=...` and `GET /observations?stationId=...&from=...&to=...`, with support for `limit`, `nextToken`, `order`, and optional evenly sampled history via `sample`.
+- [`aws/ingest/app.py`](./aws/ingest/app.py) accepts `POST /observations`, requires the `x-weatherstation-key` header, normalizes `source_ts_utc` and `received_at_utc` from ISO-8601 or epoch input, validates known `weather` fields, computes source-clock skew metadata, writes history rows idempotently, and advances `LATEST` by normalized `received_at_utc` with `ingested_at_utc` as the tie-breaker for distinct writes.
+- [`aws/read/app.py`](./aws/read/app.py) serves `GET /observations/latest?stationId=...` and `GET /observations?stationId=...&from=...&to=...`, with support for `limit`, `nextToken`, `order`, and optional evenly sampled history via `sample`. Latest, raw-history, and sampled-history items expose `source_ts_utc`, `received_at_utc`, `ingested_at_utc`, `display_ts_utc`, `source_time_suspect`, and `source_clock_skew_seconds` so live clients can use receive/display time for freshness when the station clock is suspect.
 - [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml) provisions API Gateway HTTP API, the ingest/read Lambdas, IAM permissions, and the DynamoDB table.
 
 ## Data Model
@@ -220,8 +220,10 @@ The architecture document defines these SQLite tables:
 The DynamoDB table uses a single-table key design:
 
 - partition key: `pk = STATION#<source_node_id>`
-- historical observation key: `sk = OBS#<normalized_source_ts_utc>#WEATHER`
+- historical observation key: `sk = OBS#<normalized_source_ts_utc>#WEATHER#RECEIVED#<normalized_received_at_utc>#MSG#<msg_id>`
 - latest snapshot key: `sk = LATEST`
+
+The source timestamp remains the leading primary-key component. History `from`/`to` queries use `ObservationDisplayTimeIndex` and its `history_sort` key, which follows `display_ts_utc` and retains the original key as a tie-breaker. `LATEST` is selected by receiver time rather than source time. A source clock is marked suspect when the absolute receiver-minus-source skew exceeds 600 seconds, or when the source time rolls back behind the current `LATEST` while receiver time moves forward (with ingestion time breaking equal-receiver-time ties). When suspect, `display_ts_utc` is `received_at_utc`; otherwise it is `source_ts_utc`. Existing records are included through the additive [display-time index backfill](docs/operations/history_display_time_index.md).
 
 ## Setup
 
@@ -311,13 +313,18 @@ python .\scripts\home\meshtastic_debug_logger.py
 
 ### AWS stack
 
-Deploy [`aws/weather-station-stack.yaml`](./aws/weather-station-stack.yaml) or [`aws/packaged-template.yaml`](./aws/packaged-template.yaml) with values for:
+Use [`scripts/aws/package_backend.py`](./scripts/aws/package_backend.py) to package the Lambda sources and shared aggregate module, then deploy the generated [`aws/packaged-template.yaml`](./aws/packaged-template.yaml). Supply values for:
 
 - `ProjectName`
 - `EnvironmentName`
 - `ApiSharedSecret`
 - `TableName`
 - `AllowedCorsOrigin`
+- `HistoryIndexName`: leave empty during migration, then set to `ObservationDisplayTimeIndex` after backfill verification and index activation.
+
+For an existing stack, follow the staged deployment and rollback procedure in [display-time weather history](docs/operations/history_display_time_index.md). Do not enable indexed reads before the backfill is complete.
+
+For bounded charts and background CSV exports, follow [aggregate history deployment](docs/operations/aggregate_history.md). Keep both feature flags false until the backfill is verified, then enable rollup processing before aggregate reads.
 
 Current read-path throttle overrides for API Gateway are captured in [`route-settings.json`](./route-settings.json).
 
@@ -333,7 +340,7 @@ Current read-path throttle overrides for API Gateway are captured in [`route-set
 
 - The production architecture is documented for the full garden -> home server -> AWS path.
 - The repository currently includes the garden bridge, the full home-server listener/parser/storage/queue-worker path, the shared config loader, the retention cleanup job, a standalone Meshtastic logger utility, AWS ingest/read Lambdas, infrastructure templates, and local validation/mock scripts.
-- There is currently no automated test suite in this repository; validation is still script-based.
+- Focused standard-library unit tests for the AWS ingest and read handlers live in `aws/ingest/test_app.py` and `aws/read/test_app.py`; the repository also retains its local validation and mock scripts.
 
 ## License
 

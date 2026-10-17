@@ -18,6 +18,26 @@ Parameters:
   AllowedCorsOrigin:
     Type: String
     Default: '*'
+  HistoryIndexName:
+    Type: String
+    Default: ''
+    AllowedValues:
+    - ''
+    - ObservationDisplayTimeIndex
+    Description: Enable ObservationDisplayTimeIndex only after the history backfill
+      is verified.
+  EnableRollupProcessing:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+    - 'false'
+    - 'true'
+  EnableAggregateHistory:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+    - 'false'
+    - 'true'
 Resources:
   WeatherObservationsTable:
     Type: AWS::DynamoDB::Table
@@ -30,11 +50,24 @@ Resources:
         AttributeType: S
       - AttributeName: sk
         AttributeType: S
+      - AttributeName: history_sort
+        AttributeType: S
       KeySchema:
       - AttributeName: pk
         KeyType: HASH
       - AttributeName: sk
         KeyType: RANGE
+      GlobalSecondaryIndexes:
+      - IndexName: ObservationDisplayTimeIndex
+        KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: history_sort
+          KeyType: RANGE
+        Projection:
+          ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
   WeatherLambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -65,10 +98,23 @@ Resources:
               - Arn
           - Effect: Allow
             Action:
+            - dynamodb:Query
+            Resource:
+            - Fn::Sub: ${WeatherObservationsTable.Arn}/index/ObservationDisplayTimeIndex
+          - Effect: Allow
+            Action:
             - logs:CreateLogGroup
             - logs:CreateLogStream
             - logs:PutLogEvents
             Resource: '*'
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:Query
+            Resource:
+              Fn::GetAtt:
+              - HistoryRollupsTable
+              - Arn
   IngestObservationFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -94,7 +140,7 @@ Resources:
             Ref: AllowedCorsOrigin
       Code:
         S3Bucket: brahm-weather-station-cfn-artifacts-2026
-        S3Key: 97a1981e5ce997baef6c8a183e411ada
+        S3Key: weather-station-dev/2026-10-17-aggregate-history/951c4d433a038a516a0f363fc610606b16d74a29571cdd402fc5687e52dd5bcd/ingest.zip
   ReadObservationFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -106,8 +152,8 @@ Resources:
         Fn::GetAtt:
         - WeatherLambdaRole
         - Arn
-      Timeout: 10
-      MemorySize: 256
+      Timeout: 30
+      MemorySize: 512
       Architectures:
       - arm64
       Environment:
@@ -116,9 +162,15 @@ Resources:
             Ref: WeatherObservationsTable
           ALLOWED_CORS_ORIGIN:
             Ref: AllowedCorsOrigin
+          HISTORY_INDEX_NAME:
+            Ref: HistoryIndexName
+          ROLLUP_TABLE_NAME:
+            Ref: HistoryRollupsTable
+          AGGREGATE_HISTORY_ENABLED:
+            Ref: EnableAggregateHistory
       Code:
         S3Bucket: brahm-weather-station-cfn-artifacts-2026
-        S3Key: 1f4ded92f0e12e4b1493437f0dcee00b
+        S3Key: weather-station-dev/2026-10-17-aggregate-history/03aa410f1aa66c04680f5cb593a17784f231da508584fcc0da6453fb412295e2/read.zip
   WeatherHttpApi:
     Type: AWS::ApiGatewayV2::Api
     Properties:
@@ -132,6 +184,7 @@ Resources:
         - GET
         - POST
         - OPTIONS
+        - DELETE
         AllowHeaders:
         - content-type
         - x-weatherstation-key
@@ -188,6 +241,28 @@ Resources:
         Ref: WeatherHttpApi
       StageName: $default
       AutoDeploy: true
+      RouteSettings:
+        GET /observations/latest:
+          ThrottlingBurstLimit: 5
+          ThrottlingRateLimit: 1
+        GET /observations:
+          ThrottlingBurstLimit: 7
+          ThrottlingRateLimit: 2
+        POST /observations/exports:
+          ThrottlingBurstLimit: 2
+          ThrottlingRateLimit: 1
+        GET /observations/exports/{jobId}:
+          ThrottlingBurstLimit: 5
+          ThrottlingRateLimit: 2
+        DELETE /observations/exports/{jobId}:
+          ThrottlingBurstLimit: 2
+          ThrottlingRateLimit: 1
+    DependsOn:
+    - GetLatestRoute
+    - GetHistoryRoute
+    - CreateHistoryExportRoute
+    - GetHistoryExportRoute
+    - CancelHistoryExportRoute
   LambdaInvokePermissionForIngest:
     Type: AWS::Lambda::Permission
     Properties:
@@ -202,6 +277,371 @@ Resources:
     Properties:
       FunctionName:
         Ref: ReadObservationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WeatherHttpApi}/*/*
+  HistoryRollupsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName:
+        Fn::Sub: ${ProjectName}-${EnvironmentName}-history-rollups
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: pk
+        AttributeType: S
+      - AttributeName: sk
+        AttributeType: S
+      KeySchema:
+      - AttributeName: pk
+        KeyType: HASH
+      - AttributeName: sk
+        KeyType: RANGE
+  HistoryExportJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: ${ProjectName}-${EnvironmentName}-history-export-jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: pk
+        AttributeType: S
+      KeySchema:
+      - AttributeName: pk
+        KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+  HistoryExportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+        - Id: ExpireExports
+          Status: Enabled
+          ExpirationInDays: 2
+          AbortIncompleteMultipartUpload:
+            DaysAfterInitiation: 1
+  HistoryExportDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+  HistoryExportQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+          - HistoryExportDeadLetterQueue
+          - Arn
+        maxReceiveCount: 5
+  HistoryRollupFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+  HistoryRollupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: HistoryRollups
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:Query
+            Resource:
+            - Fn::GetAtt:
+              - WeatherObservationsTable
+              - Arn
+            - Fn::Sub: ${WeatherObservationsTable.Arn}/index/ObservationDisplayTimeIndex
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:Query
+            Resource:
+              Fn::GetAtt:
+              - HistoryRollupsTable
+              - Arn
+          - Effect: Allow
+            Action:
+            - dynamodb:DescribeStream
+            - dynamodb:GetRecords
+            - dynamodb:GetShardIterator
+            - dynamodb:ListStreams
+            Resource:
+              Fn::GetAtt:
+              - WeatherObservationsTable
+              - StreamArn
+          - Effect: Allow
+            Action:
+            - sqs:SendMessage
+            Resource:
+              Fn::GetAtt:
+              - HistoryRollupFailureQueue
+              - Arn
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+  HistoryExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: HistoryExports
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:Query
+            Resource:
+            - Fn::GetAtt:
+              - WeatherObservationsTable
+              - Arn
+            - Fn::Sub: ${WeatherObservationsTable.Arn}/index/ObservationDisplayTimeIndex
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:TransactWriteItems
+            Resource:
+              Fn::GetAtt:
+              - HistoryExportJobsTable
+              - Arn
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:AbortMultipartUpload
+            - s3:DeleteObject
+            Resource:
+              Fn::Sub: ${HistoryExportBucket.Arn}/*
+          - Effect: Allow
+            Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            Resource:
+              Fn::GetAtt:
+              - HistoryExportQueue
+              - Arn
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+  HistoryRollupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: ${ProjectName}-${EnvironmentName}-history-rollup
+      Runtime: python3.13
+      Handler: app.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - HistoryRollupRole
+        - Arn
+      Timeout: 120
+      MemorySize: 512
+      Architectures:
+      - arm64
+      Code:
+        S3Bucket: brahm-weather-station-cfn-artifacts-2026
+        S3Key: weather-station-dev/2026-10-17-aggregate-history/f0b50c200f61d76acf111b81cbde8a1afc8f1966b58ca55d74569f4a23e9d87d/rollup.zip
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: WeatherObservationsTable
+          ROLLUP_TABLE_NAME:
+            Ref: HistoryRollupsTable
+          HISTORY_INDEX_NAME:
+            Ref: HistoryIndexName
+      ReservedConcurrentExecutions: 1
+  HistoryExportApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: ${ProjectName}-${EnvironmentName}-history-export-api
+      Runtime: python3.13
+      Handler: app.api_handler
+      Role:
+        Fn::GetAtt:
+        - HistoryExportRole
+        - Arn
+      Timeout: 30
+      MemorySize: 256
+      Architectures:
+      - arm64
+      Code:
+        S3Bucket: brahm-weather-station-cfn-artifacts-2026
+        S3Key: weather-station-dev/2026-10-17-aggregate-history/98b6ade8c7aa0eca787ea1e1fc3b542c88dbadce77104afeb6fc0e519c33e1c8/export.zip
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: WeatherObservationsTable
+          HISTORY_INDEX_NAME:
+            Ref: HistoryIndexName
+          EXPORT_JOBS_TABLE:
+            Ref: HistoryExportJobsTable
+          EXPORT_BUCKET:
+            Ref: HistoryExportBucket
+          EXPORT_QUEUE_URL:
+            Ref: HistoryExportQueue
+          ALLOWED_CORS_ORIGIN:
+            Ref: AllowedCorsOrigin
+          API_SHARED_SECRET:
+            Ref: ApiSharedSecret
+  HistoryExportWorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: ${ProjectName}-${EnvironmentName}-history-export-worker
+      Runtime: python3.13
+      Handler: app.worker_handler
+      Role:
+        Fn::GetAtt:
+        - HistoryExportRole
+        - Arn
+      Timeout: 90
+      MemorySize: 512
+      Architectures:
+      - arm64
+      Code:
+        S3Bucket: brahm-weather-station-cfn-artifacts-2026
+        S3Key: weather-station-dev/2026-10-17-aggregate-history/98b6ade8c7aa0eca787ea1e1fc3b542c88dbadce77104afeb6fc0e519c33e1c8/export.zip
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: WeatherObservationsTable
+          HISTORY_INDEX_NAME:
+            Ref: HistoryIndexName
+          EXPORT_JOBS_TABLE:
+            Ref: HistoryExportJobsTable
+          EXPORT_BUCKET:
+            Ref: HistoryExportBucket
+          EXPORT_QUEUE_URL:
+            Ref: HistoryExportQueue
+          ALLOWED_CORS_ORIGIN:
+            Ref: AllowedCorsOrigin
+      ReservedConcurrentExecutions: 1
+  HistoryRollupStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn:
+        Fn::GetAtt:
+        - WeatherObservationsTable
+        - StreamArn
+      FunctionName:
+        Ref: HistoryRollupFunction
+      StartingPosition: TRIM_HORIZON
+      Enabled:
+        Fn::If:
+        - RollupProcessingEnabled
+        - true
+        - false
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 30
+      ParallelizationFactor: 1
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: 10
+      MaximumRecordAgeInSeconds: 86400
+      DestinationConfig:
+        OnFailure:
+          Destination:
+            Fn::GetAtt:
+            - HistoryRollupFailureQueue
+            - Arn
+  HistoryExportQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn:
+        Fn::GetAtt:
+        - HistoryExportQueue
+        - Arn
+      FunctionName:
+        Ref: HistoryExportWorkerFunction
+      BatchSize: 1
+      FunctionResponseTypes:
+      - ReportBatchItemFailures
+  ExportIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId:
+        Ref: WeatherHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::GetAtt:
+        - HistoryExportApiFunction
+        - Arn
+      PayloadFormatVersion: '2.0'
+  CreateHistoryExportRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: WeatherHttpApi
+      RouteKey: POST /observations/exports
+      Target:
+        Fn::Sub: integrations/${ExportIntegration}
+  GetHistoryExportRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: WeatherHttpApi
+      RouteKey: GET /observations/exports/{jobId}
+      Target:
+        Fn::Sub: integrations/${ExportIntegration}
+  CancelHistoryExportRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: WeatherHttpApi
+      RouteKey: DELETE /observations/exports/{jobId}
+      Target:
+        Fn::Sub: integrations/${ExportIntegration}
+  LambdaInvokePermissionForExport:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: HistoryExportApiFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn:
@@ -225,3 +665,17 @@ Outputs:
     Description: Read Lambda function name
     Value:
       Ref: ReadObservationFunction
+  RollupTableNameOutput:
+    Value:
+      Ref: HistoryRollupsTable
+  ExportJobsTableNameOutput:
+    Value:
+      Ref: HistoryExportJobsTable
+  ExportBucketNameOutput:
+    Value:
+      Ref: HistoryExportBucket
+Conditions:
+  RollupProcessingEnabled:
+    Fn::Equals:
+    - Ref: EnableRollupProcessing
+    - 'true'

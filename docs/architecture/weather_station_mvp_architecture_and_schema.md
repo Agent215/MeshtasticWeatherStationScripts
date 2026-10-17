@@ -71,18 +71,17 @@ That means a temporary internet outage does not prevent local capture. The queue
 
 ## 1.3 Identity model for weather observations
 
-The system currently treats a weather observation as uniquely identified by:
+The home and cloud stores intentionally use different observation identities:
+
+- **SQLite**: `weather_readings` stores the source timestamp text exactly as parsed and has `UNIQUE(source_node_id, source_ts_utc)`.
+- **DynamoDB**: source time remains the leading, normalized history-key component for backward-compatible range queries, while normalized receiver time and `msg_id` distinguish raw packets:
 
 ```text
-(source_node_id, source_ts_utc)
+pk = STATION#<source_node_id>
+sk = OBS#<normalized_source_ts_utc>#WEATHER#RECEIVED#<normalized_received_at_utc>#MSG#<msg_id>
 ```
 
-That identity is used in both places, but the normalization step happens only in AWS:
-
-- **SQLite**: `weather_readings` stores the source timestamp text exactly as parsed and has `UNIQUE(source_node_id, source_ts_utc)`
-- **DynamoDB**: the ingest Lambda normalizes `source_ts_utc` to sortable UTC before building observation sort keys
-
-With the current garden bridge, `ts` is emitted consistently, so the raw home-side value and the normalized cloud value still behave as the same timestamp identity. `msg_id` still matters, but it is mainly transport/debug metadata rather than the canonical dedupe key for weather history.
+An exact retry with the same station, source time, receiver time, and message id resolves to the same cloud key and is deduped. A distinct packet can reuse a source timestamp after a clock rollback without overwriting the existing DynamoDB history item. This cloud behavior does not change the home-side SQLite uniqueness constraint.
 
 ---
 
@@ -678,8 +677,9 @@ The worker sends `API_KEY` in the `x-weatherstation-key` header. Within `weather
 
 The queue worker still sends both values:
 
-- `msg_id` remains useful for tracing and debugging
-- `source_ts_utc` is forwarded exactly as stored in SQLite and is the important identity field for cloud history dedupe
+- `msg_id` remains useful for tracing and debugging and is part of the cloud history-key suffix
+- `source_ts_utc` is forwarded exactly as stored in SQLite and becomes the leading, normalized component used for cloud source-time ordering and range queries
+- `received_at_utc` and `msg_id` distinguish cloud history rows that repeat the same source timestamp
 
 With the current bridge, `source_ts_utc` is typically an epoch-seconds string. The ingest Lambda normalizes it before writing DynamoDB.
 
@@ -1303,7 +1303,7 @@ The controller increments a local `msg_id` for each forwarded message. That mean
 
 - it is useful for tracing transport behavior
 - it can reset after reboot
-- it is not ideal as the canonical cloud dedupe key for weather history
+- it is not used alone as the cloud dedupe key; the cloud combines it with station, source time, receiver time, and record type
 
 ## 7.3 Health/debug heartbeat
 
@@ -1401,7 +1401,7 @@ The current logical item types are:
 
 ### Observation item
 ```text
-sk = OBS#<normalized_source_ts_utc>#WEATHER
+sk = OBS#<normalized_source_ts_utc>#WEATHER#RECEIVED#<normalized_received_at_utc>#MSG#<msg_id>
 ```
 
 ### Latest item
@@ -1411,11 +1411,11 @@ sk = LATEST
 
 There is no longer a separate `DEDUPE#...` item in the current design. Cloud dedupe happens by conditionally writing the observation item itself.
 
-## 9.3 Why the observation sort key uses `source_ts_utc`
+## 9.3 Why the observation sort key starts with `source_ts_utc`
 
-Using the source timestamp gives the cloud a stable event identity that survives retries and sender restarts better than a sender-local message counter.
+Keeping normalized source time immediately after `OBS#` preserves primary-key identities and source-time ordering for diagnostics and migration rollback. Dashboard range queries use the separate display-time index described in section 12.2, so suspect station clocks do not hide recent observations.
 
-Because timestamps are normalized to sortable UTC ISO strings, lexicographic ordering also matches time ordering.
+Source time is not the complete raw observation identity. The receiver-time and message-id suffix prevents a repeated source timestamp from overwriting a distinct cloud record. Both legacy `OBS#<source>#WEATHER` keys and new suffixed keys remain inside the same `OBS#<from>` through `OBS#<to>~` range.
 
 ---
 
@@ -1426,7 +1426,7 @@ Because timestamps are normalized to sortable UTC ISO strings, lexicographic ord
 ### Key pattern
 
 - `pk = STATION#<source_node_id>`
-- `sk = OBS#<normalized_source_ts_utc>#WEATHER`
+- `sk = OBS#<normalized_source_ts_utc>#WEATHER#RECEIVED#<normalized_received_at_utc>#MSG#<msg_id>`
 
 ### Attributes
 
@@ -1438,11 +1438,14 @@ Because timestamps are normalized to sortable UTC ISO strings, lexicographic ord
 | `observation_type` | Literal `WEATHER` |
 | `source_node_id` | Station id |
 | `source_name` | Optional node name passed through from Meshtastic metadata |
-| `msg_id` | Sender-side message id for tracing |
-| `source_ts_utc` | Normalized source timestamp used as the canonical identity timestamp |
+| `msg_id` | Sender-side message id used for tracing and as part of the raw-key suffix |
+| `source_ts_utc` | Normalized source timestamp used for source-time ordering and queries |
 | `source_ts_raw` | Original source timestamp value as sent by the home server |
 | `source_ts_sort_utc` | Normalized sortable UTC timestamp |
 | `received_at_utc` | Normalized home-server receive timestamp |
+| `display_ts_utc` | `received_at_utc` when source time is suspect; otherwise `source_ts_utc` |
+| `source_time_suspect` | Whether skew or rollback detection says source time is unreliable for display/freshness |
+| `source_clock_skew_seconds` | `received_at_utc - source_ts_utc`, in seconds |
 | `weather` | Nested weather object |
 | `raw_payload` | Full request body received by the ingest Lambda |
 | `ingested_at_utc` | Time the observation was written to DynamoDB |
@@ -1473,13 +1476,17 @@ This is the durable cloud history record.
 | `source_ts_raw` | Original source timestamp value from the request |
 | `source_ts_sort_utc` | Normalized sortable source timestamp |
 | `received_at_utc` | Normalized home-server receive timestamp |
-| `weather` | Nested weather object of the newest reading |
+| `ingested_at_utc` | Time at which this latest snapshot candidate was ingested |
+| `display_ts_utc` | `received_at_utc` when source time is suspect; otherwise `source_ts_utc` |
+| `source_time_suspect` | Whether skew or rollback detection says source time is unreliable for display/freshness |
+| `source_clock_skew_seconds` | `received_at_utc - source_ts_utc`, in seconds |
+| `weather` | Nested weather object of the newest receiver-time-selected packet |
 | `latest_observation_sk` | Sort key of the observation item that this latest snapshot points to |
 | `updated_at_utc` | Time the latest snapshot was refreshed |
 
 ### Role
 
-This makes latest-read operations a simple point lookup rather than a time-range query.
+This makes latest-read operations a simple point lookup rather than a time-range query. The snapshot represents the newest accepted receiver-time packet, not necessarily the greatest source timestamp.
 
 ---
 
@@ -1531,7 +1538,7 @@ The Lambda validates:
 - `payload.source_node_id` must be a string
 - `payload.msg_id` must be integer-convertible
 - `payload.received_at_utc` must be a valid timestamp
-- `payload.source_ts_utc` must be present for weather identity
+- `payload.source_ts_utc` must be present for the cloud history primary key and clock-quality diagnostics
 - `payload.weather` must be an object
 
 It also validates recognized weather fields against numeric range rules.
@@ -1569,16 +1576,37 @@ It also normalizes milliseconds and microseconds when needed.
 
 This normalized form is what becomes:
 
-- the observation identity timestamp
-- the observation sort key component
-- the `source_ts_sort_utc` attribute
+- the `source_ts_utc` and `source_ts_sort_utc` attributes
+- the leading source-time component of the observation sort key
+- the normalized receiver-time key suffix and the primary `LATEST` ordering value
 
-## 11.5 Cloud dedupe behavior
+## 11.5 Source-clock skew and display time
+
+When both normalized timestamps are available, ingest computes:
+
+```text
+source_clock_skew_seconds = received_at_utc - source_ts_utc
+```
+
+The default threshold is 600 seconds. `source_time_suspect` becomes true when either condition holds:
+
+- `abs(source_clock_skew_seconds) > 600`
+- the incoming source time is older than the current `LATEST` source time while receiver time is newer, or while receiver time is equal and ingestion time is newer
+
+The second rule catches a smaller clock rollback that does not cross the absolute-skew threshold. When source time is suspect, `display_ts_utc` is `received_at_utc`; otherwise it is `source_ts_utc`. Ingest stores the skew, suspect flag, and display timestamp on both the raw observation and `LATEST` items.
+
+## 11.6 Cloud dedupe behavior
 
 The current cloud dedupe strategy is:
 
 ```text
-one station + one normalized source timestamp + WEATHER record type = one observation item
+one station + normalized source time + WEATHER + normalized receiver time + msg_id = one observation item
+```
+
+The resulting key is:
+
+```text
+OBS#<source>#WEATHER#RECEIVED#<received>#MSG#<msg_id>
 ```
 
 The Lambda writes the observation item with a conditional expression:
@@ -1589,15 +1617,22 @@ attribute_not_exists(pk) AND attribute_not_exists(sk)
 
 If that conditional write fails, the Lambda returns a successful response with `deduped: true`.
 
-This means the observation item itself is the dedupe gate.
+During rollout, ingest also checks the legacy unsuffixed key for the same source timestamp. If its stored `msg_id` and `received_at_utc` match, the legacy row is treated as the canonical observation rather than creating a one-time suffixed duplicate.
+
+This means the observation item itself is the dedupe gate. Exact queue retries remain idempotent across the key migration, while a distinct packet with the same source timestamp gets a different key when its receiver time or message id differs.
 
 There is no separate dedupe marker row anymore.
 
-## 11.6 Latest item update rule
+## 11.7 Latest item update rule
 
-After inserting the observation item, the Lambda writes the `LATEST` item only when the incoming observation is at least as new as the current latest snapshot.
+After attempting the observation write, the Lambda conditionally writes `LATEST` using normalized receiver time:
 
-That prevents an out-of-order older observation from moving the latest pointer backward.
+- a later `received_at_utc` advances `LATEST`
+- for distinct writes with equal `received_at_utc`, later `ingested_at_utc` breaks the tie
+- an older `received_at_utc` keeps its raw history item but does not move `LATEST` backward
+- a legacy latest item with no `received_at_utc` can be replaced
+
+An exact deduped retry does not use its new ingestion time to displace the same receiver-time snapshot. Most importantly, `source_ts_utc` is not part of the `LATEST` ordering condition. A newly received packet therefore becomes live/latest even when a reboot has moved its source clock backward.
 
 ---
 
@@ -1635,20 +1670,20 @@ Optional:
 
 ## 12.2 Time-range query behavior
 
-The read Lambda does not normalize `from` and `to`. Callers must send timestamps that already match the sortable UTC form used in the stored sort keys, for example `2026-03-18T00:45:46.982324Z`.
+The read Lambda normalizes timezone-aware ISO-8601 or epoch `from` and `to` values to fixed-width UTC, for example `2026-03-18T00:45:46.982324Z`. This keeps inclusive exact-second bounds such as `2026-03-18T00:45:46Z` aligned with stored `.000000Z` keys. History selection follows `display_ts_utc`: receiver time when the source clock is suspect and source time otherwise.
 
-It then queries the partition using a sort key range like:
+With `HISTORY_INDEX_NAME=ObservationDisplayTimeIndex`, it queries the station partition in that index using `history_sort`:
 
 ```text
-from: OBS#<from>
-to:   OBS#<to>~
+from: DISPLAY#<from>
+to:   DISPLAY#<to>~
 ```
 
-The trailing `~` is a lexical upper-bound trick that ensures all matching observation keys in the time range are included.
+The trailing `~` includes every observation at the exact upper-bound instant. Each index key is `DISPLAY#<normalized display time>#<original sk>`, preserving distinct rows with identical display timestamps. Primary keys and source timestamps remain unchanged. Only observations have `history_sort`, so `LATEST` is excluded. The index projects all attributes for raw API compatibility. Existing records are populated using the conditional, additive backfill in [the deployment procedure](../operations/history_display_time_index.md). An empty `HISTORY_INDEX_NAME` retains source-time queries only for staged deployment or rollback; indexed reads must not be enabled until the index is ACTIVE and the backfill is verified. Pagination tokens are index-specific and must be restarted across cutover.
 
 In raw mode, the query uses `ScanIndexForward = False` by default and flips to ascending order only when `order=asc`.
 
-When `sample` is provided, the Lambda scans the full matching window in ascending order, projects only the fields needed for sampling, caps the scan at 50,000 matched items, and returns an evenly sampled subset instead of paginated raw results.
+When `sample` is provided, the Lambda scans the full matching window in ascending order, projects only the fields needed for sampling, caps the scan at 50,000 matched items, and returns an evenly sampled subset instead of paginated raw results. The projection includes source, receiver, ingestion, display, suspect, and skew metadata so graph clients do not lose clock-quality context.
 
 ## 12.3 Response structure
 
@@ -1678,6 +1713,17 @@ When `sample` is provided, the Lambda scans the full matching window in ascendin
 ```
 
 `nextToken` is present only when more raw results are available.
+
+Latest, raw-history, and sampled-history items expose these timestamp fields when the underlying timestamps are valid:
+
+- `source_ts_utc`
+- `received_at_utc`
+- `ingested_at_utc`
+- `display_ts_utc`
+- `source_time_suspect`
+- `source_clock_skew_seconds`
+
+The read Lambda derives skew/display metadata for legacy items when possible and maps a legacy latest item's `updated_at_utc` to `ingested_at_utc` when the newer field is absent. Live clients should use `display_ts_utc`, `received_at_utc`, or `ingested_at_utc` for freshness; a stale source timestamp alone must not make the station appear offline.
 
 ### Sampled history response
 
@@ -1730,7 +1776,7 @@ This division gives the system good failure behavior:
 - if AWS is down, local capture still works
 - if the network is flaky, the queue can retry later
 - if the same observation is retried multiple times, cloud history stays stable
-- if an observation arrives out of order, history is still preserved without corrupting the latest pointer
+- if source time rolls backward, history is preserved and receiver-time ordering keeps the live/latest pointer current
 
 ---
 
@@ -1754,7 +1800,7 @@ If the Meshtastic packet does not include a user name, the final cloud record wi
 
 ## 14.2 `msg_id` behavior
 
-`msg_id` is still useful, but its role is different from `source_ts_utc`.
+`msg_id` is useful both operationally and as one component of the cloud raw-history key. It is not a globally unique counter because it can reset after reboot.
 
 ### `msg_id`
 Useful for:
@@ -1763,14 +1809,17 @@ Useful for:
 - comparing sender-side counters to cloud history
 - debugging skipped or rate-limited packets
 - correlating logs
+- distinguishing cloud raw-history keys together with source and receiver time
 
 ### `source_ts_utc`
 Used for:
 
 - local weather uniqueness
-- cloud observation identity
-- time-range queries
-- idempotent retries
+- the leading cloud source-time sort component
+- display-time range queries over both legacy and newer observations
+- clock-skew and rollback diagnostics
+
+Cloud retry idempotency comes from the full station/source/receiver/message key, not from source time or message id alone.
 
 ## 14.3 Why sender and cloud counts can drift
 
@@ -1833,7 +1882,18 @@ The MVP is built around a solid pattern:
 
 The home-side SQLite schema and `storage.py` implementation make the Pi resilient to network outages and repeated packets. The AWS side keeps the cloud model simple by storing:
 
-- one historical observation item per `(station, source timestamp, record type)`
+- one historical observation item per `(station, source timestamp, record type, receiver timestamp, message id)`
 - one latest snapshot item per station
 
-The most important system-wide design choice is that **weather identity is timestamp-based**, not message-counter-based. That decision now lines up across both SQLite and DynamoDB, which makes deduplication, retry behavior, and time-range querying much easier to reason about.
+The home store retains its timestamp-based dedupe rule. The cloud extends that identity with receiver time and message id so source-clock rollback cannot overwrite raw history, while preserving the source-time key prefix for existing range queries. `LATEST` follows receiver time, and the explicit skew/display metadata lets live clients remain accurate when station time is unreliable.
+
+
+## Bounded history extension
+
+The opt-in `view=chart` read API uses a separate table of UTC hourly, daily,
+monthly, and yearly summaries maintained from the observation stream. Legacy
+raw, sampled, and latest endpoints remain compatible. Summary statistics retain
+sums/counts and extrema; rain and lightning use interval totals. Large CSV exports
+run as resumable SQS jobs and stream original readings into private S3 objects.
+See [aggregate history operations](../operations/aggregate_history.md) for the API
+contract, deployment gates, backfill, packaging, limits, and rollback procedure.

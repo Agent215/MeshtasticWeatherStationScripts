@@ -2,29 +2,59 @@ openapi: 3.0.3
 info:
   title: Weather Station HTTP API
   version: 1.0.0
-  description: |
-    OpenAPI description for the currently implemented AWS HTTP API.
+  description: 'OpenAPI description for the currently implemented AWS HTTP API.
+
 
     The ingest lambda accepts only `POST /observations`.
+
     The read lambda serves `GET /observations/latest` and `GET /observations`.
+
+    '
 servers:
-  - url: /
+- url: /
 tags:
-  - name: ingest
-  - name: read
+- name: ingest
+- name: read
 paths:
   /observations:
     post:
       tags:
-        - ingest
+      - ingest
       summary: Ingest a weather observation
-      description: |
-        Creates a history observation row and updates the `LATEST` row when the
-        incoming `source_ts_utc` is newer than or equal to the current latest.
+      description: 'Creates a history observation row whose sort key starts with normalized
+
+        `source_ts_utc` and is suffixed with normalized `received_at_utc` and
+
+        `msg_id`. Exact retries dedupe, while distinct packets that repeat a
+
+        source timestamp remain separate history items.
+
+
+        `source_clock_skew_seconds` is `received_at_utc - source_ts_utc`.
+
+        `source_time_suspect` is true when the absolute skew exceeds 600 seconds,
+
+        or when source time rolls back behind the current `LATEST` while receiver
+
+        time moves forward (or equal receiver times are ordered by a newer
+
+        ingestion time). `display_ts_utc` uses receiver time when suspect and
+
+        source time otherwise.
+
+
+        `LATEST` advances primarily by normalized `received_at_utc`. For distinct
+
+        writes with the same receiver timestamp, `ingested_at_utc` is the
+
+        tie-breaker. Source time does not control live/latest freshness.
+
 
         Authentication is handled with the `x-weatherstation-key` header.
+
+        '
       security:
-        - WeatherStationKey: []
+      - WeatherStationKey: []
       requestBody:
         required: true
         content:
@@ -46,7 +76,9 @@ paths:
                     source_node_id: garden-node-01
                     msg_id: 1742666412
                     source_ts_utc: '2026-03-18T00:45:46.982324Z'
-                    observation_sk: 'OBS#2026-03-18T00:45:46.982324Z#WEATHER'
+                    source_time_suspect: false
+                    source_clock_skew_seconds: 1.017676
+                    observation_sk: OBS#2026-03-18T00:45:46.982324Z#WEATHER#RECEIVED#2026-03-18T00:45:48.000000Z#MSG#1742666412
                 deduped:
                   value:
                     ok: true
@@ -54,15 +86,17 @@ paths:
                     source_node_id: garden-node-01
                     msg_id: 1742666412
                     source_ts_utc: '2026-03-18T00:45:46.982324Z'
-                    observation_sk: 'OBS#2026-03-18T00:45:46.982324Z#WEATHER'
+                    source_time_suspect: false
+                    source_clock_skew_seconds: 1.017676
+                    observation_sk: OBS#2026-03-18T00:45:46.982324Z#WEATHER#RECEIVED#2026-03-18T00:45:48.000000Z#MSG#1742666412
         '400':
           description: Invalid JSON or validation failure.
           content:
             application/json:
               schema:
                 oneOf:
-                  - $ref: '#/components/schemas/ErrorResponse'
-                  - $ref: '#/components/schemas/ValidationErrorResponse'
+                - $ref: '#/components/schemas/ErrorResponse'
+                - $ref: '#/components/schemas/ValidationErrorResponse'
               examples:
                 invalidJson:
                   value:
@@ -73,8 +107,8 @@ paths:
                     ok: false
                     error: validation_failed
                     details:
-                      - payload.source_node_id is required and must be a string
-                      - payload.received_at_utc must include timezone information
+                    - payload.source_node_id is required and must be a string
+                    - payload.received_at_utc must include timezone information
         '401':
           description: Missing or invalid shared secret.
           content:
@@ -84,25 +118,55 @@ paths:
               example:
                 ok: false
                 error: unauthorized
-
     get:
       tags:
-        - read
+      - read
       summary: Get observation history
-      description: |
-        Returns either a raw paged history window or an evenly sampled result set.
+      description: 'Returns either a raw paged history window or an evenly sampled
+        result set.
 
-        `from` and `to` are used directly in the DynamoDB sort-key range lookup.
-        They are not normalized by the read lambda, so they should match the
-        stored UTC-sortable timestamp format produced by ingest.
+
+        Timezone-aware ISO-8601 or epoch `from` and `to` values are normalized to
+
+        same fixed-width UTC format as the display-time history index. Ranges
+
+        use `display_ts_utc`: receiver time when the source clock is suspect,
+
+        source time otherwise. Existing primary keys and source timestamps
+
+        remain unchanged. Legacy and newer observations are indexed by the
+
+        backfill described in docs/operations/history_display_time_index.md.
+
+
+        With view=chart, select bounded raw detail or UTC hour/day/month/year aggregates
+        automatically. Summary statistics cover every matched observation; unavailable
+        history remains empty. See docs/operations/aggregate_history.md.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/StationId'
-        - $ref: '#/components/parameters/From'
-        - $ref: '#/components/parameters/To'
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Order'
-        - $ref: '#/components/parameters/NextToken'
-        - $ref: '#/components/parameters/Sample'
+      - $ref: '#/components/parameters/StationId'
+      - $ref: '#/components/parameters/From'
+      - $ref: '#/components/parameters/To'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Order'
+      - $ref: '#/components/parameters/NextToken'
+      - $ref: '#/components/parameters/Sample'
+      - name: view
+        in: query
+        schema:
+          type: string
+          enum:
+          - chart
+        description: Opt into bounded aggregate history; omission retains the existing
+          contract.
+      - name: maxPoints
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 2000
+          default: 800
       responses:
         '200':
           description: Raw or sampled history response.
@@ -110,8 +174,9 @@ paths:
             application/json:
               schema:
                 oneOf:
-                  - $ref: '#/components/schemas/RawHistoryResponse'
-                  - $ref: '#/components/schemas/SampledHistoryResponse'
+                - $ref: '#/components/schemas/RawHistoryResponse'
+                - $ref: '#/components/schemas/SampledHistoryResponse'
+                - $ref: '#/components/schemas/ChartHistoryResponse'
               examples:
                 raw:
                   value:
@@ -121,32 +186,38 @@ paths:
                     from: '2026-03-18T00:00:00.000000Z'
                     to: '2026-03-18T23:59:59.999999Z'
                     order: desc
-                    count: 2
+                    count: 1
                     items:
-                      - pk: STATION#garden-node-01
-                        sk: OBS#2026-03-18T00:46:46.982324Z#WEATHER
-                        record_type: observation
-                        observation_type: WEATHER
-                        source_node_id: garden-node-01
-                        source_name: garden-node
-                        msg_id: 1742666472
-                        source_ts_utc: '2026-03-18T00:46:46.982324Z'
-                        source_ts_raw: '2026-03-18T00:46:46.982324Z'
-                        source_ts_sort_utc: '2026-03-18T00:46:46.982324Z'
-                        received_at_utc: '2026-03-18T00:46:48.000000Z'
-                        weather:
-                          air_temp_c: 14.8
-                          relative_humidity_pct: 61
-                          station_pressure_hpa: 1012.6
-                        raw_payload:
-                          payload:
-                            source_node_id: garden-node-01
-                            msg_id: 1742666472
-                            source_ts_utc: '2026-03-18T00:46:46.982324Z'
-                            received_at_utc: '2026-03-18T00:46:48.000000Z'
-                            weather:
-                              air_temp_c: 14.8
-                        ingested_at_utc: '2026-03-18T00:46:48.231456Z'
+                    - pk: STATION#garden-node-01
+                      sk: OBS#2026-03-18T00:46:46.982324Z#WEATHER#RECEIVED#2026-03-18T00:46:48.000000Z#MSG#1742666472
+                      record_type: observation
+                      observation_type: WEATHER
+                      source_node_id: garden-node-01
+                      source_name: garden-node
+                      msg_id: 1742666472
+                      source_ts_utc: '2026-03-18T00:46:46.982324Z'
+                      source_ts_raw: '2026-03-18T00:46:46.982324Z'
+                      source_ts_sort_utc: '2026-03-18T00:46:46.982324Z'
+                      received_at_utc: '2026-03-18T00:46:48.000000Z'
+                      ingested_at_utc: '2026-03-18T00:46:48.231456Z'
+                      display_ts_utc: '2026-03-18T00:46:46.982324Z'
+                      source_time_suspect: false
+                      source_clock_skew_seconds: 1.017676
+                      weather:
+                        air_temp_c: 14.8
+                        relative_humidity_pct: 61
+                        station_pressure_hpa: 1012.6
+                      raw_payload:
+                        payload:
+                          source_node_id: garden-node-01
+                          source_name: garden-node
+                          msg_id: 1742666472
+                          source_ts_utc: '2026-03-18T00:46:46.982324Z'
+                          received_at_utc: '2026-03-18T00:46:48.000000Z'
+                          weather:
+                            air_temp_c: 14.8
+                            relative_humidity_pct: 61
+                            station_pressure_hpa: 1012.6
                 sampled:
                   value:
                     ok: true
@@ -154,20 +225,26 @@ paths:
                     stationId: garden-node-01
                     from: '2026-03-18T00:00:00.000000Z'
                     to: '2026-03-18T23:59:59.999999Z'
-                    sampleRequested: 3
+                    sampleRequested: 1
                     totalMatched: 1440
-                    count: 3
+                    count: 1
                     items:
-                      - pk: STATION#garden-node-01
-                        sk: OBS#2026-03-18T00:00:46.982324Z#WEATHER
-                        record_type: observation
-                        source_node_id: garden-node-01
-                        source_name: garden-node
-                        msg_id: 1742664046
-                        source_ts_utc: '2026-03-18T00:00:46.982324Z'
-                        received_at_utc: '2026-03-18T00:00:48.000000Z'
-                        weather:
-                          air_temp_c: 14.1
+                    - pk: STATION#garden-node-01
+                      sk: OBS#2026-03-18T00:00:46.982324Z#WEATHER#RECEIVED#2026-03-18T00:00:48.000000Z#MSG#1742664046
+                      record_type: observation
+                      observation_type: WEATHER
+                      source_node_id: garden-node-01
+                      source_name: garden-node
+                      msg_id: 1742664046
+                      source_ts_utc: '2026-03-18T00:00:46.982324Z'
+                      source_ts_sort_utc: '2026-03-18T00:00:46.982324Z'
+                      received_at_utc: '2026-03-18T00:00:48.000000Z'
+                      ingested_at_utc: '2026-03-18T00:00:48.231456Z'
+                      display_ts_utc: '2026-03-18T00:00:46.982324Z'
+                      source_time_suspect: false
+                      source_clock_skew_seconds: 1.017676
+                      weather:
+                        air_temp_c: 14.1
         '400':
           description: Missing parameters or invalid paging or sampling request.
           content:
@@ -187,14 +264,26 @@ paths:
                   value:
                     ok: false
                     error: invalid_nextToken
-
+        '503':
+          description: Aggregate history not ready, read budget exhausted, or temporary
+            service failure.
   /observations/latest:
     get:
       tags:
-        - read
+      - read
       summary: Get the latest observation for a station
+      description: 'Returns the newest accepted packet by normalized receiver time,
+        with
+
+        ingestion time breaking ties between distinct writes. Clients should use
+
+        `display_ts_utc`, `received_at_utc`, or `ingested_at_utc` for live
+
+        freshness instead of treating a suspect `source_ts_utc` as offline.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/StationId'
+      - $ref: '#/components/parameters/StationId'
       responses:
         '200':
           description: Latest observation item.
@@ -216,12 +305,16 @@ paths:
                   source_ts_raw: '2026-03-18T00:46:46.982324Z'
                   source_ts_sort_utc: '2026-03-18T00:46:46.982324Z'
                   received_at_utc: '2026-03-18T00:46:48.000000Z'
+                  ingested_at_utc: '2026-03-18T00:46:48.231456Z'
+                  display_ts_utc: '2026-03-18T00:46:46.982324Z'
+                  source_time_suspect: false
+                  source_clock_skew_seconds: 1.017676
                   weather:
                     air_temp_c: 14.8
                     relative_humidity_pct: 61
                     station_pressure_hpa: 1012.6
-                  latest_observation_sk: 'OBS#2026-03-18T00:46:46.982324Z#WEATHER'
-                  updated_at_utc: '2026-03-18T00:46:48.231789Z'
+                  latest_observation_sk: OBS#2026-03-18T00:46:46.982324Z#WEATHER#RECEIVED#2026-03-18T00:46:48.000000Z#MSG#1742666472
+                  updated_at_utc: '2026-03-18T00:46:48.231456Z'
         '400':
           description: Missing station identifier.
           content:
@@ -240,6 +333,82 @@ paths:
               example:
                 ok: false
                 error: not_found
+  /observations/exports:
+    post:
+      tags:
+      - read
+      summary: Queue a full raw CSV export (UTC and SI units)
+      security:
+      - WeatherStationKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - stationId
+              - from
+              - to
+              properties:
+                stationId:
+                  type: string
+                from:
+                  type: string
+                to:
+                  type: string
+      responses:
+        '202':
+          description: Queued or existing active job.
+        '400':
+          description: Invalid window.
+        '401':
+          description: Missing or invalid key.
+        '404':
+          description: Station not found.
+        '429':
+          description: Another station export is active.
+        '503':
+          description: Temporary queue failure.
+  /observations/exports/{jobId}:
+    parameters:
+    - name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+    get:
+      tags:
+      - read
+      summary: Get CSV export progress or a temporary download link
+      security:
+      - WeatherStationKey: []
+      responses:
+        '200':
+          description: Job status with rowsExported; ready jobs have downloadUrl and
+            fileName.
+        '401':
+          description: Missing or invalid key.
+        '404':
+          description: Job not found.
+        '410':
+          description: Job expired.
+    delete:
+      tags:
+      - read
+      summary: Cancel a queued or running CSV export
+      security:
+      - WeatherStationKey: []
+      responses:
+        '200':
+          description: Job status with rowsExported; ready jobs have downloadUrl and
+            fileName.
+        '401':
+          description: Missing or invalid key.
+        '404':
+          description: Job not found.
+        '410':
+          description: Job expired.
 components:
   securitySchemes:
     WeatherStationKey:
@@ -247,7 +416,6 @@ components:
       in: header
       name: x-weatherstation-key
       description: Shared secret required by `POST /observations`.
-
   parameters:
     StationId:
       name: stationId
@@ -260,9 +428,14 @@ components:
       name: from
       in: query
       required: true
-      description: |
-        Inclusive lower bound for the observation range. This value is used
-        directly in the sort-key prefix query as `OBS#<from>`.
+      description: 'Inclusive lower display-time bound for the observation range.
+        Valid
+
+        Timezone-aware ISO-8601 or epoch values are normalized before building
+
+        `DISPLAY#<from>` in ObservationDisplayTimeIndex.
+
+        '
       schema:
         type: string
         example: '2026-03-18T00:00:00.000000Z'
@@ -270,9 +443,14 @@ components:
       name: to
       in: query
       required: true
-      description: |
-        Inclusive upper bound for the observation range. This value is used
-        directly in the sort-key prefix query as `OBS#<to>~`.
+      description: 'Inclusive upper display-time bound for the observation range.
+        Valid
+
+        Timezone-aware ISO-8601 or epoch values are normalized before building
+
+        `DISPLAY#<to>~` in ObservationDisplayTimeIndex.
+
+        '
       schema:
         type: string
         example: '2026-03-18T23:59:59.999999Z'
@@ -299,44 +477,48 @@ components:
       name: nextToken
       in: query
       required: false
-      description: Base64url-encoded DynamoDB `LastEvaluatedKey` from a prior raw history response.
+      description: Base64url-encoded DynamoDB `LastEvaluatedKey` from a prior raw
+        history response.
       schema:
         type: string
     Sample:
       name: sample
       in: query
       required: false
-      description: |
-        When provided, the API scans the full range in ascending order and
+      description: 'When provided, the API scans the full range in ascending order
+        and
+
         returns an evenly sampled result set instead of paged raw history.
+
+        '
       schema:
         type: integer
         minimum: 1
         maximum: 2000
-
   schemas:
     TimestampInput:
       oneOf:
-        - type: string
-          description: ISO-8601 timestamp with timezone, or a numeric epoch encoded as a string.
-          example: '2026-03-18T00:45:46.982324Z'
-        - type: number
-          description: Epoch timestamp in seconds, milliseconds, or microseconds.
-          example: 1742268346.982324
-
+      - type: string
+        description: ISO-8601 timestamp with timezone, or a numeric epoch encoded
+          as a string.
+        example: '2026-03-18T00:45:46.982324Z'
+      - type: number
+        description: Epoch timestamp in seconds, milliseconds, or microseconds.
+        example: 1742268346.982324
     MsgIdInput:
       oneOf:
-        - type: integer
-          example: 1742666412
-        - type: string
-          pattern: '^-?\d+$'
-          example: '1742666412'
-
+      - type: integer
+        example: 1742666412
+      - type: string
+        pattern: ^-?\d+$
+        example: '1742666412'
     WeatherFields:
       type: object
-      description: |
-        Weather object accepted by ingest. Known fields are range-validated.
+      description: 'Weather object accepted by ingest. Known fields are range-validated.
+
         Unknown fields are currently preserved and stored as provided.
+
+        '
       properties:
         timestamp:
           $ref: '#/components/schemas/TimestampInput'
@@ -391,10 +573,10 @@ components:
         precipitation_type:
           type: integer
           enum:
-            - 0
-            - 1
-            - 2
-            - 3
+          - 0
+          - 1
+          - 2
+          - 3
         lightning_avg_distance_km:
           type: number
           minimum: 0
@@ -426,21 +608,20 @@ components:
         precipitation_analysis_type:
           type: integer
           enum:
-            - 0
-            - 1
-            - 2
-            - 3
-            - 4
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
       additionalProperties: true
-
     ObservationPayload:
       type: object
       required:
-        - source_node_id
-        - msg_id
-        - source_ts_utc
-        - received_at_utc
-        - weather
+      - source_node_id
+      - msg_id
+      - source_ts_utc
+      - received_at_utc
+      - weather
       properties:
         source_node_id:
           type: string
@@ -457,29 +638,29 @@ components:
         weather:
           $ref: '#/components/schemas/WeatherFields'
       additionalProperties: true
-
     IngestObservationRequest:
       type: object
       required:
-        - payload
+      - payload
       properties:
         payload:
           $ref: '#/components/schemas/ObservationPayload'
-
     IngestResponse:
       type: object
       required:
-        - ok
-        - deduped
-        - source_node_id
-        - msg_id
-        - source_ts_utc
-        - observation_sk
+      - ok
+      - deduped
+      - source_node_id
+      - msg_id
+      - source_ts_utc
+      - source_time_suspect
+      - source_clock_skew_seconds
+      - observation_sk
       properties:
         ok:
           type: boolean
           enum:
-            - true
+          - true
         deduped:
           type: boolean
         source_node_id:
@@ -489,54 +670,61 @@ components:
         source_ts_utc:
           type: string
           example: '2026-03-18T00:45:46.982324Z'
+        source_time_suspect:
+          type: boolean
+          description: True when source time fails the skew or rollback checks.
+        source_clock_skew_seconds:
+          type: number
+          description: Normalized `received_at_utc - source_ts_utc`, in seconds.
         observation_sk:
           type: string
-          example: 'OBS#2026-03-18T00:45:46.982324Z#WEATHER'
-
+          example: OBS#2026-03-18T00:45:46.982324Z#WEATHER#RECEIVED#2026-03-18T00:45:48.000000Z#MSG#1742666412
     ErrorResponse:
       type: object
       required:
-        - ok
-        - error
+      - ok
+      - error
       properties:
         ok:
           type: boolean
           enum:
-            - false
+          - false
         error:
           type: string
-
     ValidationErrorResponse:
       allOf:
-        - $ref: '#/components/schemas/ErrorResponse'
-        - type: object
-          required:
-            - details
-          properties:
-            error:
+      - $ref: '#/components/schemas/ErrorResponse'
+      - type: object
+        required:
+        - details
+        properties:
+          error:
+            type: string
+            enum:
+            - validation_failed
+          details:
+            type: array
+            items:
               type: string
-              enum:
-                - validation_failed
-            details:
-              type: array
-              items:
-                type: string
-
     LatestItem:
       type: object
       required:
-        - pk
-        - sk
-        - record_type
-        - observation_type
-        - source_node_id
-        - msg_id
-        - source_ts_utc
-        - source_ts_sort_utc
-        - received_at_utc
-        - weather
-        - latest_observation_sk
-        - updated_at_utc
+      - pk
+      - sk
+      - record_type
+      - observation_type
+      - source_node_id
+      - msg_id
+      - source_ts_utc
+      - source_ts_sort_utc
+      - received_at_utc
+      - ingested_at_utc
+      - display_ts_utc
+      - source_time_suspect
+      - source_clock_skew_seconds
+      - weather
+      - latest_observation_sk
+      - updated_at_utc
       properties:
         pk:
           type: string
@@ -547,11 +735,11 @@ components:
         record_type:
           type: string
           enum:
-            - latest
+          - latest
         observation_type:
           type: string
           enum:
-            - WEATHER
+          - WEATHER
         source_node_id:
           type: string
         source_name:
@@ -562,12 +750,33 @@ components:
           type: string
         source_ts_raw:
           oneOf:
-            - type: string
-            - type: number
+          - type: string
+          - type: number
         source_ts_sort_utc:
           type: string
         received_at_utc:
           type: string
+          description: Normalized time at which the home receiver saw the packet.
+        ingested_at_utc:
+          type: string
+          description: Time at which this latest snapshot candidate was ingested.
+        display_ts_utc:
+          type: string
+          description: Receiver time when source time is suspect; otherwise source
+            time.
+        source_time_suspect:
+          type: boolean
+          description: 'True when absolute clock skew exceeds 600 seconds, or ingest
+            detected
+
+            source-time rollback while receiver time advanced, or while receiver
+
+            time was equal and ingestion time advanced.
+
+            '
+        source_clock_skew_seconds:
+          type: number
+          description: Normalized `received_at_utc - source_ts_utc`, in seconds.
         weather:
           $ref: '#/components/schemas/WeatherFields'
         latest_observation_sk:
@@ -575,21 +784,23 @@ components:
         updated_at_utc:
           type: string
       additionalProperties: true
-
     HistoryObservationItem:
       type: object
       required:
-        - pk
-        - sk
-        - record_type
-        - observation_type
-        - source_node_id
-        - msg_id
-        - source_ts_utc
-        - source_ts_sort_utc
-        - received_at_utc
-        - weather
-        - ingested_at_utc
+      - pk
+      - sk
+      - record_type
+      - observation_type
+      - source_node_id
+      - msg_id
+      - source_ts_utc
+      - source_ts_sort_utc
+      - received_at_utc
+      - display_ts_utc
+      - source_time_suspect
+      - source_clock_skew_seconds
+      - weather
+      - ingested_at_utc
       properties:
         pk:
           type: string
@@ -598,11 +809,11 @@ components:
         record_type:
           type: string
           enum:
-            - observation
+          - observation
         observation_type:
           type: string
           enum:
-            - WEATHER
+          - WEATHER
         source_node_id:
           type: string
         source_name:
@@ -613,12 +824,30 @@ components:
           type: string
         source_ts_raw:
           oneOf:
-            - type: string
-            - type: number
+          - type: string
+          - type: number
         source_ts_sort_utc:
           type: string
         received_at_utc:
           type: string
+          description: Normalized time at which the home receiver saw the packet.
+        display_ts_utc:
+          type: string
+          description: Receiver time when source time is suspect; otherwise source
+            time.
+        source_time_suspect:
+          type: boolean
+          description: 'True when absolute clock skew exceeds 600 seconds, or ingest
+            detected
+
+            source-time rollback while receiver time advanced, or while receiver
+
+            time was equal and ingestion time advanced.
+
+            '
+        source_clock_skew_seconds:
+          type: number
+          description: Normalized `received_at_utc - source_ts_utc`, in seconds.
         weather:
           $ref: '#/components/schemas/WeatherFields'
         raw_payload:
@@ -627,18 +856,23 @@ components:
         ingested_at_utc:
           type: string
       additionalProperties: true
-
     SampledObservationItem:
       type: object
       required:
-        - pk
-        - sk
-        - record_type
-        - source_node_id
-        - msg_id
-        - source_ts_utc
-        - received_at_utc
-        - weather
+      - pk
+      - sk
+      - record_type
+      - observation_type
+      - source_node_id
+      - msg_id
+      - source_ts_utc
+      - source_ts_sort_utc
+      - received_at_utc
+      - ingested_at_utc
+      - display_ts_utc
+      - source_time_suspect
+      - source_clock_skew_seconds
+      - weather
       properties:
         pk:
           type: string
@@ -647,7 +881,11 @@ components:
         record_type:
           type: string
           enum:
-            - observation
+          - observation
+        observation_type:
+          type: string
+          enum:
+          - WEATHER
         source_node_id:
           type: string
         source_name:
@@ -656,45 +894,65 @@ components:
           type: integer
         source_ts_utc:
           type: string
+        source_ts_sort_utc:
+          type: string
         received_at_utc:
           type: string
+          description: Normalized time at which the home receiver saw the packet.
+        ingested_at_utc:
+          type: string
+        display_ts_utc:
+          type: string
+          description: Receiver time when source time is suspect; otherwise source
+            time.
+        source_time_suspect:
+          type: boolean
+          description: 'True when absolute clock skew exceeds 600 seconds, or ingest
+            detected
+
+            source-time rollback while receiver time advanced, or while receiver
+
+            time was equal and ingestion time advanced.
+
+            '
+        source_clock_skew_seconds:
+          type: number
+          description: Normalized `received_at_utc - source_ts_utc`, in seconds.
         weather:
           $ref: '#/components/schemas/WeatherFields'
       additionalProperties: true
-
     LatestResponse:
       type: object
       required:
-        - ok
-        - item
+      - ok
+      - item
       properties:
         ok:
           type: boolean
           enum:
-            - true
+          - true
         item:
           $ref: '#/components/schemas/LatestItem'
-
     RawHistoryResponse:
       type: object
       required:
-        - ok
-        - mode
-        - stationId
-        - from
-        - to
-        - order
-        - count
-        - items
+      - ok
+      - mode
+      - stationId
+      - from
+      - to
+      - order
+      - count
+      - items
       properties:
         ok:
           type: boolean
           enum:
-            - true
+          - true
         mode:
           type: string
           enum:
-            - raw
+          - raw
         stationId:
           type: string
         from:
@@ -704,8 +962,8 @@ components:
         order:
           type: string
           enum:
-            - asc
-            - desc
+          - asc
+          - desc
         count:
           type: integer
         items:
@@ -714,28 +972,27 @@ components:
             $ref: '#/components/schemas/HistoryObservationItem'
         nextToken:
           type: string
-
     SampledHistoryResponse:
       type: object
       required:
-        - ok
-        - mode
-        - stationId
-        - from
-        - to
-        - sampleRequested
-        - totalMatched
-        - count
-        - items
+      - ok
+      - mode
+      - stationId
+      - from
+      - to
+      - sampleRequested
+      - totalMatched
+      - count
+      - items
       properties:
         ok:
           type: boolean
           enum:
-            - true
+          - true
         mode:
           type: string
           enum:
-            - sampled
+          - sampled
         stationId:
           type: string
         from:
@@ -752,3 +1009,52 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SampledObservationItem'
+    ChartHistoryResponse:
+      type: object
+      required:
+      - ok
+      - mode
+      - resolution
+      - items
+      - summary
+      - coverage
+      - count
+      - totalMatched
+      properties:
+        ok:
+          type: boolean
+        mode:
+          type: string
+          enum:
+          - detail
+          - aggregate
+        resolution:
+          type: string
+          enum:
+          - raw
+          - hour
+          - day
+          - month
+          - year
+        maxPoints:
+          type: integer
+        count:
+          type: integer
+        totalMatched:
+          type: integer
+        items:
+          type: array
+          items:
+            type: object
+            description: Raw observation or aggregate with bucketStart/bucketEnd/count/weather/stats.
+        summary:
+          type: object
+        coverage:
+          type: object
+        updatedAt:
+          type: string
+          format: date-time
+        timestampBasis:
+          type: string
+          enum:
+          - display
